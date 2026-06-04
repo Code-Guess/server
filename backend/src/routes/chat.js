@@ -82,13 +82,13 @@ router.post('/', async (req, res) => {
           }
         }
 
-        // Masquer le bloc <thinking>
-        let displayContent = streamedContent;
-        displayContent = displayContent.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '');
-        if (displayContent.includes('<thinking>')) {
-          displayContent = displayContent.replace(/<thinking>[\s\S]*/g, '');
-        }
-        displayContent = displayContent.trimStart();
+        // Tant que <thinking> pas fermé → ne rien envoyer
+        if (!streamedContent.includes('</thinking>')) return;
+
+        // Thinking fermé → envoyer seulement ce qui est après
+        let displayContent = streamedContent
+          .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
+          .trimStart();
 
         if (displayContent) {
           send({ type: 'chunk', content: displayContent });
@@ -118,7 +118,9 @@ function parseStepsFromPartial(partial) {
   }
   const matches = [...partial.matchAll(/"title"\s*:\s*"([^"\\]+)"/g)];
   if (matches.length > 0) return matches.map(m => ({ title: m[1] }));
-  const lines = partial.split('\n').map(l => l.replace(/^[-*•#>\d.)\s]+/, '').trim()).filter(l => l.length > 4);
+  const lines = partial.split('\n')
+    .map(l => l.replace(/^[-*•#>\d.)\s]+/, '').trim())
+    .filter(l => l.length > 4);
   if (lines.length > 0) return lines.slice(0, 4).map(l => ({ title: l.slice(0, 80) }));
   return [];
 }
