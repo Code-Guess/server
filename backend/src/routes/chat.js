@@ -5,8 +5,60 @@ const { getSystemPrompt } = require('../prompts');
 const { runSearchAgent } = require('../agents/searchAgents');
 const { runCodePipeline, needsCodePipeline } = require('../agents/codeAgents');
 
+// ── Requêtes qui ne nécessitent PAS de recherche web ─────────────────────────
+const NO_SEARCH_PATTERNS = [
+  /^(bonjour|salut|hello|hi|hey|bonsoir|coucou)\b/i,
+  /^(merci|thanks|thank you)\b/i,
+  /^\d[\d\s+\-*/^().,]*$/,
+  /^(résume|reformule|traduis|corrige|améliore)\s/i,
+  /^(continue|vas-y|ok|oui|non|d'accord)\b/i,
+  /^(quel est ton nom|qui es-tu|tu es qui|what are you)\b/i,
+];
+
+function needsSearch(query) {
+  const q = query.trim();
+  if (q.length < 8) return false;
+  return !NO_SEARCH_PATTERNS.some(re => re.test(q));
+}
+
+// ── Labels selon l'agent ──────────────────────────────────────────────────────
+function getAgentLabel(agent) {
+  switch (agent) {
+    case 'image':     return 'images';
+    case 'academic':  return 'articles académiques';
+    case 'reddit':    return 'discussions Reddit';
+    case 'wikipedia': return 'articles Wikipedia';
+    default:          return 'sources web';
+  }
+}
+
+// ── Résumé lisible de ce que la recherche a trouvé ───────────────────────────
+function buildSearchSummary(searchResult) {
+  if (!searchResult || searchResult.sources.length === 0) return null;
+
+  const { agent, sources } = searchResult;
+  const count = sources.length;
+  const label = getAgentLabel(agent);
+
+  const titles = sources
+    .slice(0, 3)
+    .map(s => `• ${s.title.slice(0, 60)}${s.title.length > 60 ? '…' : ''}`)
+    .join('\n');
+
+  return `J'ai trouvé ${count} ${label} :\n${titles}${count > 3 ? `\n• … et ${count - 3} de plus` : ''}\n\nJe synthétise maintenant…`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 router.post('/', async (req, res) => {
-  const { message, history = [], model = 'opus', deepResearch = false, webSearch = false, max_tokens, temperature } = req.body;
+  const {
+    message,
+    history = [],
+    model = 'opus',
+    deepResearch = false,
+    max_tokens,
+    temperature,
+  } = req.body;
 
   if (!message || typeof message !== 'string') {
     return res.status(400).json({ error: 'message requis' });
@@ -22,6 +74,7 @@ router.post('/', async (req, res) => {
   const done = () => { res.write('data: [DONE]\n\n'); res.end(); };
 
   try {
+    // ── Pipeline code (deep research) ────────────────────────────────────────
     if (deepResearch && needsCodePipeline(message)) {
       await runCodePipeline(message, (agentSteps) => {
         send({ type: 'pipeline', steps: agentSteps });
@@ -32,24 +85,73 @@ router.post('/', async (req, res) => {
       return;
     }
 
+    // ── Recherche systématique ────────────────────────────────────────────────
     let systemContext = '';
     let sources = [];
 
-    if (webSearch) {
-      const searchResult = await runSearchAgent(message);
-      if (searchResult) {
-        sources = searchResult.sources;
-        systemContext = searchResult.contextBlock;
-        send({ type: 'sources', sources });
+    if (needsSearch(message)) {
+
+      // 1. Globe animé — recherche en cours
+      send({
+        type: 'searching',
+        status: 'loading',
+        label: 'Recherche en cours…',
+        icon: 'globe',
+      });
+
+      try {
+        const searchResult = await runSearchAgent(message);
+
+        if (searchResult?.sources?.length > 0) {
+          sources = searchResult.sources;
+          systemContext = searchResult.contextBlock;
+
+          // 2. Sources brutes pour l'UI (cartes cliquables)
+          send({
+            type: 'sources',
+            sources,
+            agent: searchResult.agent,
+          });
+
+          // 3. Résumé de ce qui a été trouvé — affiché AVANT la réponse LLM
+          const summary = buildSearchSummary(searchResult);
+          send({
+            type: 'searching',
+            status: 'done',
+            label: summary,
+            icon: 'globe',
+            count: sources.length,
+            agent: searchResult.agent,
+          });
+
+        } else {
+          send({
+            type: 'searching',
+            status: 'done',
+            label: 'Aucun résultat trouvé — je réponds avec mes connaissances.',
+            icon: 'globe',
+          });
+        }
+
+      } catch (err) {
+        console.warn('[chat] Recherche échouée :', err.message);
+        send({
+          type: 'searching',
+          status: 'error',
+          label: 'Recherche indisponible — réponse directe.',
+          icon: 'globe',
+        });
       }
     }
 
+    // ── Construction du prompt ────────────────────────────────────────────────
     const systemPrompt = getSystemPrompt(message, systemContext || undefined);
 
     const previousMessages = (history ?? [])
       .filter(m => m.role && m.content)
       .map(m => ({ role: m.role, content: m.content }));
 
+    // ── Appel LLM en streaming ────────────────────────────────────────────────
     let streamedContent = '';
 
     const result = await openRouterFetch({
@@ -64,7 +166,6 @@ router.post('/', async (req, res) => {
       onChunk: (chunk) => {
         streamedContent = chunk;
 
-        // Étapes thinking en temps réel
         const thinkMatch = streamedContent.match(/<thinking>([\s\S]*)/);
         if (thinkMatch) {
           const partial = thinkMatch[1];
@@ -82,10 +183,8 @@ router.post('/', async (req, res) => {
           }
         }
 
-        // Tant que <thinking> pas fermé → ne rien envoyer
         if (!streamedContent.includes('</thinking>')) return;
 
-        // Thinking fermé → envoyer seulement ce qui est après
         let displayContent = streamedContent
           .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
           .trimStart();
@@ -105,6 +204,8 @@ router.post('/', async (req, res) => {
     done();
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 function parseStepsFromPartial(partial) {
   const completions = [partial, partial + ']}', partial + '"]}', partial + '"}]}'];
