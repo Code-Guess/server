@@ -4,12 +4,9 @@
 
 const { openRouterFetch } = require('../openrouter');
 
-// ── Config ────────────────────────────────────────────────────────────────────
-
-const BRAVE_API_KEY = process.env.BRAVE_SEARCH_API_KEY; // clé gratuite : https://api.search.brave.com
+const SERPER_API_KEY = process.env.SERPER_KEY;
 
 // ── Détection de l'agent spécialisé ──────────────────────────────────────────
-// Note : désormais, même sans agent spécialisé, on lance toujours runWebAgent()
 
 const ACADEMIC_KW = [
   'étude', 'recherche', 'article scientifique', 'papier', 'pubmed',
@@ -37,7 +34,7 @@ function detectAgent(query) {
   if (ACADEMIC_KW.some(k => q.includes(k)))  return 'academic';
   if (REDDIT_KW.some(k => q.includes(k)))    return 'reddit';
   if (WIKIPEDIA_KW.some(k => q.includes(k))) return 'wikipedia';
-  return 'web'; // ← TOUJOURS web par défaut (plus de 'none')
+  return 'web'; // toujours web par défaut
 }
 
 // ── Rephrase via LLM ──────────────────────────────────────────────────────────
@@ -64,22 +61,18 @@ async function rephraseForSearch(query, lang = 'anglais') {
   }
 }
 
-// ── Agent Web — Brave Search (remplace DuckDuckGo) ────────────────────────────
-//
-//  Brave Search API : https://api.search.brave.com/res/v1/web/search
-//  Plan gratuit : 2 000 req/mois — suffisant pour un usage personnel/MVP
-//  Inscription : https://api.search.brave.com/app/keys
+// ── Agent Web — Serper.dev (Google Search) ────────────────────────────────────
 
 async function runWebAgent(query) {
   const q = await rephraseForSearch(query, 'français ou anglais');
-  const sources = await braveSearch(q);
+  const sources = await serperSearch(q);
 
   const contextBlock = sources.length > 0
     ? `\n\n🌐 Résultats web en temps réel :\n${sources
         .map((s, i) => `[${i + 1}] ${s.title}\n${s.snippet ?? ''}\n${s.url}`)
         .join('\n\n')
-      }\n\nBasé-toi sur ces résultats récents pour ta réponse. Cite les sources avec [numéro].`
-    : '\n\n(Aucun résultat web trouvé — réponds avec tes connaissances.)';
+      }\n\nBasé-toi sur ces résultats récents. Cite les sources avec [numéro].`
+    : '\n\n(Aucun résultat web — réponds avec tes connaissances.)';
 
   return {
     agent: 'web',
@@ -91,51 +84,65 @@ async function runWebAgent(query) {
   };
 }
 
-async function braveSearch(query) {
-  if (!BRAVE_API_KEY) {
-    console.warn('[WebAgent] BRAVE_SEARCH_API_KEY manquante — fallback DuckDuckGo');
+async function serperSearch(query) {
+  if (!SERPER_API_KEY) {
+    console.warn('[WebAgent] SERPER_KEY manquante — fallback DuckDuckGo');
     return duckduckgoInstantAnswer(query);
   }
 
   try {
-    const encoded = encodeURIComponent(query);
-    const res = await fetch(
-      `https://api.search.brave.com/res/v1/web/search?q=${encoded}&count=8&search_lang=fr&country=fr&text_decorations=false`,
-      {
-        headers: {
-          Accept: 'application/json',
-          'Accept-Encoding': 'gzip',
-          'X-Subscription-Token': BRAVE_API_KEY,
-        },
-        signal: AbortSignal.timeout(8000),
-      }
-    );
+    const res = await fetch('https://google.serper.dev/search', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-KEY': SERPER_API_KEY,
+      },
+      body: JSON.stringify({
+        q: query,
+        num: 8,
+        hl: 'fr',
+        gl: 'fr',
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
 
-    if (!res.ok) throw new Error(`Brave Search HTTP ${res.status}`);
+    if (!res.ok) throw new Error(`Serper HTTP ${res.status}`);
     const data = await res.json();
 
-    const results = (data.web?.results ?? []).map(r => ({
-      title: r.title ?? '',
-      url: r.url ?? '',
-      snippet: r.description ?? r.extra_snippets?.[0] ?? '',
-      img_src: r.thumbnail?.src ?? undefined,
-      type: 'web',
-      age: r.age ?? undefined, // ex: "2 hours ago"
-    })).filter(s => s.title && s.url);
+    const sources = [];
 
-    // Ajouter les "featured snippets" si présents
-    if (data.summarizer?.key) {
-      // (optionnel) on pourrait fetch le summarizer, mais les web results suffisent
+    // Answer box (réponse directe Google)
+    if (data.answerBox?.answer || data.answerBox?.snippet) {
+      sources.push({
+        title: data.answerBox.title ?? query,
+        url: data.answerBox.link ?? '',
+        snippet: data.answerBox.answer ?? data.answerBox.snippet,
+        type: 'web',
+        featured: true,
+      });
     }
 
-    return results.slice(0, 8);
+    // Résultats organiques
+    for (const r of (data.organic ?? [])) {
+      sources.push({
+        title: r.title ?? '',
+        url: r.link ?? '',
+        snippet: r.snippet ?? '',
+        img_src: r.imageUrl ?? undefined,
+        type: 'web',
+        date: r.date ?? undefined,
+      });
+    }
+
+    return sources.filter(s => s.title && s.url).slice(0, 8);
+
   } catch (err) {
-    console.warn('[WebAgent] Brave Search error:', err.message);
-    return duckduckgoInstantAnswer(query); // fallback
+    console.warn('[WebAgent] Serper error:', err.message);
+    return duckduckgoInstantAnswer(query);
   }
 }
 
-// Fallback minimal DuckDuckGo (instant answer seulement)
+// Fallback DuckDuckGo si Serper indisponible
 async function duckduckgoInstantAnswer(query) {
   try {
     const encoded = encodeURIComponent(query);
@@ -150,24 +157,16 @@ async function duckduckgoInstantAnswer(query) {
         title: data.Heading || query,
         url: data.AbstractURL,
         snippet: data.AbstractText,
-        img_src: data.Image ? `https://duckduckgo.com${data.Image}` : undefined,
         type: 'web',
       });
     }
     for (const t of (data.RelatedTopics ?? []).flatMap(t => t.Topics ? t.Topics : [t])) {
       if (t.FirstURL && t.Text) {
-        sources.push({
-          title: t.Text.slice(0, 90),
-          url: t.FirstURL,
-          snippet: t.Text,
-          type: 'web',
-        });
+        sources.push({ title: t.Text.slice(0, 90), url: t.FirstURL, snippet: t.Text, type: 'web' });
       }
     }
     return sources.slice(0, 5);
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
 // ── Agent Image — Wikimedia Commons ──────────────────────────────────────────
@@ -262,7 +261,7 @@ async function wikimediaFallbackFromWikipedia(query) {
       }
       if (sources.length > 0) break;
     } catch (err) {
-      console.warn('[ImageAgent] Wikipedia fallback error:', err.message);
+      console.warn(`[ImageAgent] Wikipedia fallback error:`, err.message);
     }
   }
   return sources;
@@ -470,9 +469,7 @@ async function wikipediaSearch(query) {
   return sources.slice(0, 6);
 }
 
-// ── Point d'entrée principal ──────────────────────────────────────────────────
-// Recherche TOUJOURS déclenchée, comme Perplexity.
-// forceAgent permet de forcer un agent depuis l'extérieur (ex: bouton UI).
+// ── Point d'entrée ────────────────────────────────────────────────────────────
 
 async function runSearchAgent(query, forceAgent) {
   const agent = forceAgent ?? detectAgent(query);
@@ -482,7 +479,7 @@ async function runSearchAgent(query, forceAgent) {
     case 'reddit':    return runRedditAgent(query);
     case 'wikipedia': return runWikipediaAgent(query);
     case 'web':
-    default:          return runWebAgent(query); // ← plus jamais null
+    default:          return runWebAgent(query);
   }
 }
 
