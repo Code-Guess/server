@@ -1,7 +1,3 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// src/routes/chat.js — Route POST /api/chat (streaming SSE)
-// ─────────────────────────────────────────────────────────────────────────────
-
 const express = require('express');
 const router = express.Router();
 const { openRouterFetch } = require('../openrouter');
@@ -9,27 +5,6 @@ const { getSystemPrompt } = require('../prompts');
 const { runSearchAgent } = require('../agents/searchAgents');
 const { runCodePipeline, needsCodePipeline } = require('../agents/codeAgents');
 
-/**
- * POST /api/chat
- *
- * Body :
- * {
- *   message: string,          — message de l'utilisateur
- *   history: [{role, content}],— historique de la conversation
- *   model: "opus"|"sonnet"|"haiku",
- *   deepResearch: boolean,     — true = pipeline multi-agents
- *   max_tokens?: number,
- *   temperature?: number,
- * }
- *
- * Réponse SSE :
- *   data: {"type":"chunk","content":"..."}\n\n       — streaming texte
- *   data: {"type":"thinkingSteps","steps":[...]}\n\n — étapes de réflexion
- *   data: {"type":"sources","sources":[...]}\n\n     — sources de recherche
- *   data: {"type":"pipeline","steps":[...]}\n\n      — avancement pipeline code
- *   data: {"type":"done","modelUsed":"..."}\n\n      — fin
- *   data: {"type":"error","message":"..."}\n\n       — erreur
- */
 router.post('/', async (req, res) => {
   const { message, history = [], model = 'opus', deepResearch = false, webSearch = false, max_tokens, temperature } = req.body;
 
@@ -37,24 +12,16 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'message requis' });
   }
 
-  // ── Headers SSE ────────────────────────────────────────────────────────────
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const send = (data) => {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-  };
-
-  const done = () => {
-    res.write('data: [DONE]\n\n');
-    res.end();
-  };
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const done = () => { res.write('data: [DONE]\n\n'); res.end(); };
 
   try {
-    // ── Mode flash (deepResearch) = pipeline multi-agents ──────────────────
     if (deepResearch && needsCodePipeline(message)) {
       await runCodePipeline(message, (agentSteps) => {
         send({ type: 'pipeline', steps: agentSteps });
@@ -65,7 +32,6 @@ router.post('/', async (req, res) => {
       return;
     }
 
-    // ── Recherche web (agents sans clé) — seulement si webSearch=true ────────
     let systemContext = '';
     let sources = [];
 
@@ -78,7 +44,6 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // ── Appel OpenRouter avec streaming SSE ────────────────────────────────
     const systemPrompt = getSystemPrompt(message, systemContext || undefined);
 
     const previousMessages = (history ?? [])
@@ -97,7 +62,7 @@ router.post('/', async (req, res) => {
         { role: 'user', content: message },
       ],
       onChunk: (chunk) => {
-        streamedContent += chunk;
+        streamedContent = chunk;
 
         // Étapes thinking en temps réel
         const thinkMatch = streamedContent.match(/<thinking>([\s\S]*)/);
@@ -117,14 +82,13 @@ router.post('/', async (req, res) => {
           }
         }
 
-        // Contenu visible (masque le bloc <thinking>)
+        // Masquer le bloc <thinking>
         let displayContent = streamedContent;
-        const thinkEnd = streamedContent.indexOf('</thinking>');
-        if (thinkEnd !== -1) {
-          displayContent = streamedContent.slice(thinkEnd + '</thinking>'.length).trimStart();
-        } else if (streamedContent.includes('<thinking>')) {
-          displayContent = '';
+        displayContent = displayContent.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '');
+        if (displayContent.includes('<thinking>')) {
+          displayContent = displayContent.replace(/<thinking>[\s\S]*/g, '');
         }
+        displayContent = displayContent.trimStart();
 
         if (displayContent) {
           send({ type: 'chunk', content: displayContent });
@@ -142,10 +106,7 @@ router.post('/', async (req, res) => {
   }
 });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 function parseStepsFromPartial(partial) {
-  // Essai JSON
   const completions = [partial, partial + ']}', partial + '"]}', partial + '"}]}'];
   for (const attempt of completions) {
     try {
@@ -155,10 +116,8 @@ function parseStepsFromPartial(partial) {
       }
     } catch {}
   }
-  // Regex fallback
   const matches = [...partial.matchAll(/"title"\s*:\s*"([^"\\]+)"/g)];
   if (matches.length > 0) return matches.map(m => ({ title: m[1] }));
-  // Texte libre
   const lines = partial.split('\n').map(l => l.replace(/^[-*•#>\d.)\s]+/, '').trim()).filter(l => l.length > 4);
   if (lines.length > 0) return lines.slice(0, 4).map(l => ({ title: l.slice(0, 80) }));
   return [];
