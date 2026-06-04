@@ -31,7 +31,7 @@ const { runCodePipeline, needsCodePipeline } = require('../agents/codeAgents');
  *   data: {"type":"error","message":"..."}\n\n       — erreur
  */
 router.post('/', async (req, res) => {
-  const { message, history = [], model = 'opus', deepResearch = false, max_tokens, temperature } = req.body;
+  const { message, history = [], model = 'opus', deepResearch = false, webSearch = false, max_tokens, temperature } = req.body;
 
   if (!message || typeof message !== 'string') {
     return res.status(400).json({ error: 'message requis' });
@@ -65,15 +65,17 @@ router.post('/', async (req, res) => {
       return;
     }
 
-    // ── Recherche web (agents sans clé) ────────────────────────────────────
+    // ── Recherche web (agents sans clé) — seulement si webSearch=true ────────
     let systemContext = '';
     let sources = [];
 
-    const searchResult = await runSearchAgent(message);
-    if (searchResult) {
-      sources = searchResult.sources;
-      systemContext = searchResult.contextBlock;
-      send({ type: 'sources', sources });
+    if (webSearch) {
+      const searchResult = await runSearchAgent(message);
+      if (searchResult) {
+        sources = searchResult.sources;
+        systemContext = searchResult.contextBlock;
+        send({ type: 'sources', sources });
+      }
     }
 
     // ── Appel OpenRouter avec streaming SSE ────────────────────────────────
