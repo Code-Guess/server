@@ -11,12 +11,13 @@ const OPENROUTER_MODELS = {
 };
 
 // ── Budget thinking selon le modèle ────────────────────────────────────────
-// Désactivé — thinking est Claude-specific, non supporté par Nemotron
+// budget_tokens DOIT être < max_tokens
 const THINKING_BUDGET = {
-  opus:   0,
-  sonnet: 0,
-  haiku:  0,
+  opus:   10000,  // modèle fort → plus de réflexion
+  sonnet: 8000,
+  haiku:  0,      // modèle léger → pas de thinking (trop lent/inutile)
 };
+
 
 const MAX_TOKENS = {
   opus:   16000,
