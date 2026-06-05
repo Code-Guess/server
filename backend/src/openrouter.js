@@ -1,22 +1,21 @@
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1/chat/completions';
-
 const OPENROUTER_KEYS = [
   process.env.OPENROUTER_KEY_1,
   process.env.OPENROUTER_KEY_2,
 ].filter(Boolean);
 
 const OPENROUTER_MODELS = {
-  opus:   'nvidia/nemotron-3-ultra-550b-a55b:free',
-  sonnet: 'nvidia/nemotron-3-super-120b-a12b:free',
+  opus:   'openrouter/owl-alpha',
+  sonnet: 'openrouter/owl-alpha',
   haiku:  'openai/gpt-oss-20b:free',
 };
 
 // ── Budget thinking selon le modèle ──────────────────────────────────────────
 // budget_tokens DOIT être < max_tokens
 const THINKING_BUDGET = {
-  opus:   10000,
+  opus:   10000,  // modèle fort → plus de réflexion
   sonnet: 8000,
-  haiku:  0,
+  haiku:  0,      // modèle léger → pas de thinking (trop lent/inutile)
 };
 
 const MAX_TOKENS = {
@@ -24,28 +23,6 @@ const MAX_TOKENS = {
   sonnet: 16000,
   haiku:  4096,
 };
-
-// ── Format thinking selon le modèle ──────────────────────────────────────────
-// Owl Alpha / Claude → format Anthropic : body.thinking = { type, budget_tokens }
-// Nemotron Ultra/Super → format OpenRouter : body.reasoning = { effort }
-// On détecte via le nom du modèle
-function getThinkingFormat(model) {
-  if (model.includes('owl-alpha') || model.includes('anthropic') || model.includes('claude')) {
-    return 'anthropic'; // body.thinking = { type: 'enabled', budget_tokens }
-  }
-  if (model.includes('nemotron') || model.includes('nvidia') || model.includes('deepseek') || model.includes('gemma')) {
-    return 'openrouter'; // body.reasoning = { effort }
-  }
-  return 'openrouter'; // défaut sûr
-}
-
-// Convertit un budget_tokens en effort OpenRouter
-function budgetToEffort(budget) {
-  if (budget >= 10000) return 'high';
-  if (budget >= 6000)  return 'medium';
-  if (budget >= 2000)  return 'low';
-  return 'minimal';
-}
 
 function getAvailableKeys() {
   if (OPENROUTER_KEYS.length === 0) throw new Error('Aucune clé OpenRouter configurée');
@@ -61,9 +38,8 @@ async function openRouterFetch(options) {
 
   const maxTokens = options.max_tokens ?? MAX_TOKENS[tier] ?? 16000;
   const thinkingBudget = THINKING_BUDGET[tier] ?? 0;
-  const thinkingFormat = getThinkingFormat(model);
 
-  console.log(`[OpenRouter] Streaming ${model} | max_tokens=${maxTokens} | thinking_budget=${thinkingBudget} | format=${thinkingFormat}`);
+  console.log(`[OpenRouter] Streaming ${model} | max_tokens=${maxTokens} | thinking_budget=${thinkingBudget}`);
 
   // ── Body de la requête ────────────────────────────────────────────────────
   const body = {
@@ -74,20 +50,12 @@ async function openRouterFetch(options) {
     stream: true,
   };
 
-  // Ajouter le thinking selon le format du modèle
+  // Ajouter le thinking seulement si budget > 0
   if (thinkingBudget > 0) {
-    if (thinkingFormat === 'anthropic') {
-      // Format Owl Alpha / Claude natif
-      body.thinking = {
-        type: 'enabled',
-        budget_tokens: thinkingBudget,
-      };
-    } else {
-      // Format OpenRouter unifié (Nemotron, DeepSeek, Gemma…)
-      body.reasoning = {
-        effort: budgetToEffort(thinkingBudget),
-      };
-    }
+    body.thinking = {
+      type: 'enabled',
+      budget_tokens: thinkingBudget,
+    };
   }
 
   const res = await fetch(OPENROUTER_BASE_URL, {
@@ -123,19 +91,11 @@ async function openRouterFetch(options) {
       try {
         const parsed = JSON.parse(data);
         const delta = parsed.choices?.[0]?.delta;
-
         if (delta?.content) {
           fullContent += delta.content;
           options.onChunk?.(fullContent);
         }
-
-        // Capture reasoning — les deux formats possibles
         if (delta?.reasoning) reasoning += delta.reasoning;
-        if (delta?.reasoning_details) {
-          for (const rd of delta.reasoning_details) {
-            if (rd.type === 'reasoning.text' && rd.text) reasoning += rd.text;
-          }
-        }
       } catch {}
     }
   }
