@@ -5,18 +5,18 @@ const OPENROUTER_KEYS = [
 ].filter(Boolean);
 
 const OPENROUTER_MODELS = {
-  opus:   'nvidia/nemotron-3-super-120b-a12b:free',
-  sonnet: 'nvidia/nemotron-3-super-120b-a12b:free',
-  haiku:  'nvidia/nemotron-3-super-120b-a12b:free',
+  opus:   'openrouter/owl-alpha',
+  sonnet: 'openrouter/owl-alpha',
+  haiku:  'openai/gpt-oss-20b:free',
 };
 
-
+// ── Budget thinking selon le modèle ──────────────────────────────────────────
+// budget_tokens DOIT être < max_tokens
 const THINKING_BUDGET = {
   opus:   10000,  // modèle fort → plus de réflexion
   sonnet: 8000,
   haiku:  0,      // modèle léger → pas de thinking (trop lent/inutile)
 };
-
 
 const MAX_TOKENS = {
   opus:   16000,
@@ -37,8 +37,9 @@ async function openRouterFetch(options) {
   const key = getAvailableKeys()[0];
 
   const maxTokens = options.max_tokens ?? MAX_TOKENS[tier] ?? 16000;
+  const thinkingBudget = THINKING_BUDGET[tier] ?? 0;
 
-  console.log(`[OpenRouter] Streaming ${model} | max_tokens=${maxTokens}`);
+  console.log(`[OpenRouter] Streaming ${model} | max_tokens=${maxTokens} | thinking_budget=${thinkingBudget}`);
 
   // ── Body de la requête ────────────────────────────────────────────────────
   const body = {
@@ -48,6 +49,14 @@ async function openRouterFetch(options) {
     temperature: options.temperature ?? 0.7,
     stream: true,
   };
+
+  // Ajouter le thinking seulement si budget > 0
+  if (thinkingBudget > 0) {
+    body.thinking = {
+      type: 'enabled',
+      budget_tokens: thinkingBudget,
+    };
+  }
 
   const res = await fetch(OPENROUTER_BASE_URL, {
     method: 'POST',
