@@ -5,23 +5,18 @@ const OPENROUTER_KEYS = [
   process.env.OPENROUTER_KEY_2,
 ].filter(Boolean);
 
-// ── Modèles ───────────────────────────────────────────────────────────────────
-// Ultra  : 550B params, 1M context, reasoning natif ✅ free
-// Super  : 120B params, 1M context, reasoning natif ✅ free
-// Haiku  : léger, sans thinking
 const OPENROUTER_MODELS = {
   opus:   'nvidia/nemotron-3-ultra-550b-a55b:free',
   sonnet: 'nvidia/nemotron-3-super-120b-a12b:free',
   haiku:  'openai/gpt-oss-20b:free',
 };
 
-// ── Reasoning config ──────────────────────────────────────────────────────────
-// OpenRouter utilise le param unifié `reasoning` (pas `thinking`)
-// effort : 'xhigh' | 'high' | 'medium' | 'low' | 'minimal' | 'none'
-const REASONING_CONFIG = {
-  opus:   { effort: 'high' },    // Ultra   → thinking fort
-  sonnet: { effort: 'medium' },  // Super   → thinking modéré
-  haiku:  null,                  // léger   → pas de thinking
+// ── Budget thinking selon le modèle ──────────────────────────────────────────
+// budget_tokens DOIT être < max_tokens
+const THINKING_BUDGET = {
+  opus:   10000,
+  sonnet: 8000,
+  haiku:  0,
 };
 
 const MAX_TOKENS = {
@@ -29,6 +24,28 @@ const MAX_TOKENS = {
   sonnet: 16000,
   haiku:  4096,
 };
+
+// ── Format thinking selon le modèle ──────────────────────────────────────────
+// Owl Alpha / Claude → format Anthropic : body.thinking = { type, budget_tokens }
+// Nemotron Ultra/Super → format OpenRouter : body.reasoning = { effort }
+// On détecte via le nom du modèle
+function getThinkingFormat(model) {
+  if (model.includes('owl-alpha') || model.includes('anthropic') || model.includes('claude')) {
+    return 'anthropic'; // body.thinking = { type: 'enabled', budget_tokens }
+  }
+  if (model.includes('nemotron') || model.includes('nvidia') || model.includes('deepseek') || model.includes('gemma')) {
+    return 'openrouter'; // body.reasoning = { effort }
+  }
+  return 'openrouter'; // défaut sûr
+}
+
+// Convertit un budget_tokens en effort OpenRouter
+function budgetToEffort(budget) {
+  if (budget >= 10000) return 'high';
+  if (budget >= 6000)  return 'medium';
+  if (budget >= 2000)  return 'low';
+  return 'minimal';
+}
 
 function getAvailableKeys() {
   if (OPENROUTER_KEYS.length === 0) throw new Error('Aucune clé OpenRouter configurée');
@@ -41,12 +58,14 @@ async function openRouterFetch(options) {
   const tier = options.model ?? 'opus';
   const model = OPENROUTER_MODELS[tier] ?? OPENROUTER_MODELS.opus;
   const key = getAvailableKeys()[0];
+
   const maxTokens = options.max_tokens ?? MAX_TOKENS[tier] ?? 16000;
-  const reasoningConfig = REASONING_CONFIG[tier] ?? null;
+  const thinkingBudget = THINKING_BUDGET[tier] ?? 0;
+  const thinkingFormat = getThinkingFormat(model);
 
-  console.log(`[OpenRouter] ${model} | max_tokens=${maxTokens} | reasoning=${JSON.stringify(reasoningConfig)}`);
+  console.log(`[OpenRouter] Streaming ${model} | max_tokens=${maxTokens} | thinking_budget=${thinkingBudget} | format=${thinkingFormat}`);
 
-  // ── Body ──────────────────────────────────────────────────────────────────
+  // ── Body de la requête ────────────────────────────────────────────────────
   const body = {
     model,
     messages: options.messages,
@@ -55,9 +74,20 @@ async function openRouterFetch(options) {
     stream: true,
   };
 
-  // Ajouter reasoning seulement si configuré
-  if (reasoningConfig) {
-    body.reasoning = reasoningConfig;
+  // Ajouter le thinking selon le format du modèle
+  if (thinkingBudget > 0) {
+    if (thinkingFormat === 'anthropic') {
+      // Format Owl Alpha / Claude natif
+      body.thinking = {
+        type: 'enabled',
+        budget_tokens: thinkingBudget,
+      };
+    } else {
+      // Format OpenRouter unifié (Nemotron, DeepSeek, Gemma…)
+      body.reasoning = {
+        effort: budgetToEffort(thinkingBudget),
+      };
+    }
   }
 
   const res = await fetch(OPENROUTER_BASE_URL, {
@@ -84,7 +114,6 @@ async function openRouterFetch(options) {
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-
     const chunk = decoder.decode(value, { stream: true });
     const lines = chunk.split('\n').filter(l => l.startsWith('data: '));
 
@@ -100,10 +129,8 @@ async function openRouterFetch(options) {
           options.onChunk?.(fullContent);
         }
 
-        // Reasoning : format moderne (reasoning_details) + legacy (reasoning)
-        if (delta?.reasoning) {
-          reasoning += delta.reasoning;
-        }
+        // Capture reasoning — les deux formats possibles
+        if (delta?.reasoning) reasoning += delta.reasoning;
         if (delta?.reasoning_details) {
           for (const rd of delta.reasoning_details) {
             if (rd.type === 'reasoning.text' && rd.text) reasoning += rd.text;
