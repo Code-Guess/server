@@ -5,20 +5,23 @@ const OPENROUTER_KEYS = [
   process.env.OPENROUTER_KEY_2,
 ].filter(Boolean);
 
+// ── Modèles ───────────────────────────────────────────────────────────────────
+// Ultra  : 550B params, 1M context, reasoning natif ✅ free
+// Super  : 120B params, 1M context, reasoning natif ✅ free
+// Haiku  : léger, sans thinking
 const OPENROUTER_MODELS = {
-  opus:   'nvidia/nemotron-3-super-120b-a12b:free',
+  opus:   'nvidia/nemotron-3-ultra-550b-a55b:free',
   sonnet: 'nvidia/nemotron-3-super-120b-a12b:free',
   haiku:  'openai/gpt-oss-20b:free',
 };
 
-// ── Reasoning effort selon le modèle ─────────────────────────────────────────
-// Nemotron supporte reasoning via le param unifié OpenRouter
-// On utilise "effort" (xhigh/high/medium/low/minimal/none)
-// ou "max_tokens" pour un budget précis
+// ── Reasoning config ──────────────────────────────────────────────────────────
+// OpenRouter utilise le param unifié `reasoning` (pas `thinking`)
+// effort : 'xhigh' | 'high' | 'medium' | 'low' | 'minimal' | 'none'
 const REASONING_CONFIG = {
-  opus:   { effort: 'high' },      // fort → beaucoup de réflexion
-  sonnet: { effort: 'medium' },    // intermédiaire
-  haiku:  null,                    // pas de reasoning (modèle léger)
+  opus:   { effort: 'high' },    // Ultra   → thinking fort
+  sonnet: { effort: 'medium' },  // Super   → thinking modéré
+  haiku:  null,                  // léger   → pas de thinking
 };
 
 const MAX_TOKENS = {
@@ -41,9 +44,9 @@ async function openRouterFetch(options) {
   const maxTokens = options.max_tokens ?? MAX_TOKENS[tier] ?? 16000;
   const reasoningConfig = REASONING_CONFIG[tier] ?? null;
 
-  console.log(`[OpenRouter] Streaming ${model} | max_tokens=${maxTokens} | reasoning=${JSON.stringify(reasoningConfig)}`);
+  console.log(`[OpenRouter] ${model} | max_tokens=${maxTokens} | reasoning=${JSON.stringify(reasoningConfig)}`);
 
-  // ── Body de la requête ────────────────────────────────────────────────────
+  // ── Body ──────────────────────────────────────────────────────────────────
   const body = {
     model,
     messages: options.messages,
@@ -52,8 +55,7 @@ async function openRouterFetch(options) {
     stream: true,
   };
 
-  // Ajouter le reasoning seulement si configuré
-  // OpenRouter utilise `reasoning` (pas `thinking`) pour Nemotron
+  // Ajouter reasoning seulement si configuré
   if (reasoningConfig) {
     body.reasoning = reasoningConfig;
   }
@@ -98,8 +100,10 @@ async function openRouterFetch(options) {
           options.onChunk?.(fullContent);
         }
 
-        // Reasoning : OpenRouter renvoie reasoning_details OU reasoning (legacy)
-        if (delta?.reasoning) reasoning += delta.reasoning;
+        // Reasoning : format moderne (reasoning_details) + legacy (reasoning)
+        if (delta?.reasoning) {
+          reasoning += delta.reasoning;
+        }
         if (delta?.reasoning_details) {
           for (const rd of delta.reasoning_details) {
             if (rd.type === 'reasoning.text' && rd.text) reasoning += rd.text;
