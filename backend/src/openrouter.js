@@ -10,8 +10,7 @@ const OPENROUTER_MODELS = {
   haiku:  'nvidia/nemotron-3-super-120b-a12b:free',
 };
 
-// ── Budget thinking selon le modèle ────────────────────────────────────────
-// budget_tokens DOIT être < max_tokens
+
 const THINKING_BUDGET = {
   opus:   10000,  // modèle fort → plus de réflexion
   sonnet: 8000,
