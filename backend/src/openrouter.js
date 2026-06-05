@@ -5,17 +5,17 @@ const OPENROUTER_KEYS = [
 ].filter(Boolean);
 
 const OPENROUTER_MODELS = {
-  opus:   'nvidia/nemotron-3-ultra-550b-a55b:free',
-  sonnet: 'nvidia/nemotron-3-ultra-550b-a55b:free',
-  haiku:  'nvidia/nemotron-3-ultra-550b-a55b:free',
+  opus:   'qwen/qwen3-coder:free',
+  sonnet: 'qwen/qwen3-coder:free',
+  haiku:  'qwen/qwen3-coder:free',
 };
 
 // ── Budget thinking selon le modèle ────────────────────────────────────────
 // budget_tokens DOIT être < max_tokens
 const THINKING_BUDGET = {
-  opus:   10000,  // modèle fort → plus de réflexion
+  opus:   10000,
   sonnet: 8000,
-  haiku:  0,      // modèle léger → pas de thinking (trop lent/inutile)
+  haiku:  0,
 };
 
 const MAX_TOKENS = {
