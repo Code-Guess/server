@@ -5,12 +5,12 @@ const OPENROUTER_KEYS = [
 ].filter(Boolean);
 
 const OPENROUTER_MODELS = {
-  opus:   'openrouter/owl-alpha',
-  sonnet: 'openrouter/owl-alpha',
-  haiku:  'openai/gpt-oss-20b:free',
+  opus:   'nvidia/nemotron-3-ultra-550b-a55b:free',
+  sonnet: 'nvidia/nemotron-3-ultra-550b-a55b:free',
+  haiku:  'nvidia/nemotron-3-ultra-550b-a55b:free',
 };
 
-// ── Budget thinking selon le modèle ──────────────────────────────────────────
+// ── Budget thinking selon le modèle ────────────────────────────────────────
 // budget_tokens DOIT être < max_tokens
 const THINKING_BUDGET = {
   opus:   10000,  // modèle fort → plus de réflexion
