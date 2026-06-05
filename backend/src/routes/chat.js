@@ -1,8 +1,8 @@
 const express = require('express');
-const router = express.Router();
-const { openRouterFetch } = require('../openrouter');
-const { getSystemPrompt } = require('../prompts');
-const { runSearchAgent } = require('../agents/searchAgents');
+const router  = express.Router();
+const { openRouterFetch }               = require('../openrouter');
+const { getSystemPrompt }               = require('../prompts');
+const { runSearchAgent }                = require('../agents/searchAgents');
 const { runCodePipeline, needsCodePipeline } = require('../agents/codeAgents');
 
 // ── Requêtes qui ne nécessitent PAS de recherche web ─────────────────────────
@@ -21,7 +21,6 @@ function needsSearch(query) {
   return !NO_SEARCH_PATTERNS.some(re => re.test(q));
 }
 
-// ── Labels selon l'agent ──────────────────────────────────────────────────────
 function getAgentLabel(agent) {
   switch (agent) {
     case 'image':     return 'images';
@@ -32,19 +31,15 @@ function getAgentLabel(agent) {
   }
 }
 
-// ── Résumé lisible de ce que la recherche a trouvé ───────────────────────────
 function buildSearchSummary(searchResult) {
   if (!searchResult || searchResult.sources.length === 0) return null;
-
   const { agent, sources } = searchResult;
   const count = sources.length;
   const label = getAgentLabel(agent);
-
   const titles = sources
     .slice(0, 3)
     .map(s => `• ${s.title.slice(0, 60)}${s.title.length > 60 ? '…' : ''}`)
     .join('\n');
-
   return `J'ai trouvé ${count} ${label} :\n${titles}${count > 3 ? `\n• … et ${count - 3} de plus` : ''}\n\nJe synthétise maintenant…`;
 }
 
@@ -53,8 +48,8 @@ function buildSearchSummary(searchResult) {
 router.post('/', async (req, res) => {
   const {
     message,
-    history = [],
-    model = 'opus',
+    history      = [],
+    model        = 'opus',
     deepResearch = false,
     max_tokens,
     temperature,
@@ -87,59 +82,69 @@ router.post('/', async (req, res) => {
 
     // ── Recherche systématique ────────────────────────────────────────────────
     let systemContext = '';
-    let sources = [];
+    let sources       = [];
 
     if (needsSearch(message)) {
 
-      // 1. Globe animé — recherche en cours
       send({
-        type: 'searching',
+        type:   'searching',
         status: 'loading',
-        label: 'Recherche en cours…',
-        icon: 'globe',
+        label:  'Recherche en cours…',
+        icon:   'globe',
       });
 
       try {
         const searchResult = await runSearchAgent(message);
 
-        if (searchResult?.sources?.length > 0) {
-          sources = searchResult.sources;
+        if (searchResult?.sources?.length > 0 || searchResult?.images?.length > 0) {
+          sources       = searchResult.sources;
           systemContext = searchResult.contextBlock;
 
-          // 2. Sources brutes pour l'UI (cartes cliquables)
-          send({
-            type: 'sources',
-            sources,
-            agent: searchResult.agent,
-          });
+          // ── Sources texte (cartes cliquables) ────────────────────────────
+          if (sources.length > 0) {
+            send({
+              type:    'sources',
+              sources,
+              agent:   searchResult.agent,
+            });
+          }
 
-          // 3. Résumé de ce qui a été trouvé — affiché AVANT la réponse LLM
+          // ── Images séparées — event dédié ─────────────────────────────────
+          // Envoyé indépendamment des sources texte, toujours présent si dispo
+          if (searchResult.images?.length > 0) {
+            send({
+              type:   'images',
+              images: searchResult.images,
+            });
+          }
+
+          // ── Résumé affiché avant la réponse LLM ──────────────────────────
           const summary = buildSearchSummary(searchResult);
           send({
-            type: 'searching',
+            type:   'searching',
             status: 'done',
-            label: summary,
-            icon: 'globe',
-            count: sources.length,
-            agent: searchResult.agent,
+            label:  summary,
+            icon:   'globe',
+            count:  sources.length,
+            agent:  searchResult.agent,
           });
 
         } else {
           send({
-            type: 'searching',
+            type:   'searching',
             status: 'done',
-            label: 'Aucun résultat trouvé — je réponds avec mes connaissances.',
-            icon: 'globe',
+            label:  'Aucun résultat trouvé — je réponds avec mes connaissances.',
+            icon:   'globe',
           });
         }
 
       } catch (err) {
         console.warn('[chat] Recherche échouée :', err.message);
         send({
-          type: 'searching',
+          type:   'searching',
           status: 'error',
-          label: 'Recherche indisponible — réponse directe.',
-          icon: 'globe',
+          label:  'Recherche indisponible — réponse directe.',
+          icon:   'globe',
         });
       }
     }
@@ -155,8 +160,8 @@ router.post('/', async (req, res) => {
     let streamedContent = '';
 
     const result = await openRouterFetch({
-      model: model ?? 'opus',
-      max_tokens: max_tokens ?? 8192,
+      model:       model ?? 'opus',
+      max_tokens:  max_tokens ?? 8192,
       temperature: temperature ?? 0.7,
       messages: [
         { role: 'system', content: systemPrompt },
@@ -169,15 +174,15 @@ router.post('/', async (req, res) => {
         const thinkMatch = streamedContent.match(/<thinking>([\s\S]*)/);
         if (thinkMatch) {
           const partial = thinkMatch[1];
-          const steps = parseStepsFromPartial(partial);
+          const steps   = parseStepsFromPartial(partial);
           if (steps.length > 0) {
             const thinkingComplete = streamedContent.includes('</thinking>');
             send({
-              type: 'thinkingSteps',
+              type:  'thinkingSteps',
               steps: steps.map((s, i) => ({
                 label: s.title,
-                icon: 'think',
-                done: thinkingComplete || i < steps.length - 1,
+                icon:  'think',
+                done:  thinkingComplete || i < steps.length - 1,
               })),
             });
           }
