@@ -14,31 +14,22 @@ const { runCodePipeline, needsCodePipeline } = require('../agents/codeAgents');
  *
  * Body :
  * {
- *   message: string,          — message de l'utilisateur
- *   history: [{role, content}],— historique de la conversation
+ *   message: string,           — message de l'utilisateur
+ *   history: [{role, content}], — historique de la conversation
  *   model: "opus"|"sonnet"|"haiku",
- *   deepResearch: boolean,     — true = pipeline multi-agents
- *   webSearch: boolean,        — true = forcer la recherche web
+ *   deepResearch: boolean,      — true = pipeline multi-agents
+ *   webSearch: boolean,         — true = forcer la recherche web
  *   max_tokens?: number,
  *   temperature?: number,
  * }
- *
- * Réponse SSE :
- *   data: {"type":"chunk","content":"..."}\n\n       — streaming texte
- *   data: {"type":"thinkingSteps","steps":[...]}\n\n — étapes de réflexion
- *   data: {"type":"sources","sources":[...]}\n\n     — sources de recherche
- *   data: {"type":"pipeline","steps":[...]}\n\n      — avancement pipeline code
- *   data: {"type":"done","modelUsed":"..."}\n\n      — fin
- *   data: {"type":"error","message":"..."}\n\n       — erreur
  */
 router.post('/', async (req, res) => {
-  // FIX 1 : webSearch est maintenant lu depuis req.body
   const {
     message,
-    history     = [],
-    model       = 'opus',
+    history      = [],
+    model        = 'opus',
     deepResearch = false,
-    webSearch   = false,   // ← FIX : était ignoré avant
+    webSearch    = false,   // FIX : lu depuis req.body (était ignoré avant)
     max_tokens,
     temperature,
   } = req.body;
@@ -54,17 +45,11 @@ router.post('/', async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const send = (data) => {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-  };
-
-  const done = () => {
-    res.write('data: [DONE]\n\n');
-    res.end();
-  };
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const done = () => { res.write('data: [DONE]\n\n'); res.end(); };
 
   try {
-    // ── Mode flash (deepResearch) = pipeline multi-agents ──────────────────
+    // ── Mode deepResearch = pipeline multi-agents ───────────────────────────
     if (deepResearch && needsCodePipeline(message)) {
       await runCodePipeline(message, (agentSteps) => {
         send({ type: 'pipeline', steps: agentSteps });
@@ -76,26 +61,26 @@ router.post('/', async (req, res) => {
     }
 
     // ── Recherche web ───────────────────────────────────────────────────────
-    // FIX 2 : on passe webSearch à runSearchAgent pour forcer la recherche
-    // si l'utilisateur l'a activée, même sans mots-clés déclencheurs
+    // FIX : runSearchAgent attend une string comme second argument ('web' ou undefined).
+    // Si webSearch est activé par l'utilisateur, on force l'agent 'web'.
+    // Sinon, on laisse detectAgent() choisir automatiquement selon les mots-clés.
     let systemContext = '';
     let sources = [];
 
-    const searchResult = await runSearchAgent(message, { forceSearch: webSearch });
+    const forceAgent = webSearch ? 'web' : undefined;
+    const searchResult = await runSearchAgent(message, forceAgent);
     if (searchResult) {
       sources = searchResult.sources;
       systemContext = searchResult.contextBlock;
       send({ type: 'sources', sources });
     }
 
-    // ── Appel OpenRouter avec streaming SSE ────────────────────────────────
+    // ── Prompt système ──────────────────────────────────────────────────────
     const systemPrompt = getSystemPrompt(message, systemContext || undefined);
 
-    // FIX 3 : filtrage strict de l'historique
-    // - on exclut les messages vides (content vide ou whitespace)
-    // - on s'assure que chaque entrée a bien role + content non vide
-    // Côté frontend le message courant n'est plus dans history (fix ChatContext)
-    // mais on double-vérifie ici côté backend pour être safe
+    // FIX : filtrage strict de l'historique côté backend aussi
+    // - on exclut les entrées sans role ou avec content vide
+    // - double sécurité si le frontend envoie un message vide par erreur
     const previousMessages = (history ?? [])
       .filter(m =>
         m.role &&
@@ -107,8 +92,8 @@ router.post('/', async (req, res) => {
     let streamedContent = '';
 
     const result = await openRouterFetch({
-      model: model ?? 'opus',
-      max_tokens: max_tokens ?? 8192,
+      model:       model ?? 'opus',
+      max_tokens:  max_tokens ?? 8192,
       temperature: temperature ?? 0.7,
       messages: [
         { role: 'system', content: systemPrompt },
@@ -118,7 +103,7 @@ router.post('/', async (req, res) => {
       onChunk: (chunk) => {
         streamedContent += chunk;
 
-        // Étapes thinking en temps réel
+        // ── Étapes thinking en temps réel ───────────────────────────────────
         const thinkMatch = streamedContent.match(/<thinking>([\s\S]*)/);
         if (thinkMatch) {
           const partial = thinkMatch[1];
@@ -129,20 +114,20 @@ router.post('/', async (req, res) => {
               type: 'thinkingSteps',
               steps: steps.map((s, i) => ({
                 label: s.title,
-                icon: 'think',
-                done: thinkingComplete || i < steps.length - 1,
+                icon:  'think',
+                done:  thinkingComplete || i < steps.length - 1,
               })),
             });
           }
         }
 
-        // Contenu visible (masque le bloc <thinking>)
+        // ── Contenu visible : masque le bloc <thinking> ─────────────────────
         let displayContent = streamedContent;
         const thinkEnd = streamedContent.indexOf('</thinking>');
         if (thinkEnd !== -1) {
           displayContent = streamedContent.slice(thinkEnd + '</thinking>'.length).trimStart();
         } else if (streamedContent.includes('<thinking>')) {
-          displayContent = '';
+          displayContent = ''; // bloc pas encore fermé → rien à afficher
         }
 
         if (displayContent) {
@@ -164,7 +149,6 @@ router.post('/', async (req, res) => {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function parseStepsFromPartial(partial) {
-  // Essai JSON
   const completions = [partial, partial + ']}', partial + '"]}', partial + '"]}'];
   for (const attempt of completions) {
     try {
@@ -174,11 +158,11 @@ function parseStepsFromPartial(partial) {
       }
     } catch {}
   }
-  // Regex fallback
   const matches = [...partial.matchAll(/"title"\s*:\s*"([^"\\]+)"/g)];
   if (matches.length > 0) return matches.map(m => ({ title: m[1] }));
-  // Texte libre
-  const lines = partial.split('\n').map(l => l.replace(/^[-*•#>\d.)\s]+/, '').trim()).filter(l => l.length > 4);
+  const lines = partial.split('\n')
+    .map(l => l.replace(/^[-*•#>\d.)\s]+/, '').trim())
+    .filter(l => l.length > 4);
   if (lines.length > 0) return lines.slice(0, 4).map(l => ({ title: l.slice(0, 80) }));
   return [];
 }
