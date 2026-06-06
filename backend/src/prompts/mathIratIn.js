@@ -69,8 +69,6 @@ DÉTECTION — première chose à écrire dans ta réponse
 Expressions reconnues :
   √... ≤ ou ≥ ...  (inéquation)  →  III-2° IRAT. IN.
 
-Si le type n'est pas dans cette liste → écrire uniquement :
-"⚠️ Type non reconnu dans ce cours."
 
 ══════════════════════════════════════════════════
 III-2° — INÉQUATIONS IRRATIONNELLES  √f(x) ≤ g(x)
