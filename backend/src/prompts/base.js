@@ -85,6 +85,44 @@ RÈGLES MARKDOWN :
 - Utilise # pour les titres
 - Le gras : **mot important** dans une phrase
 - Listes : - item ou 1. item
+
+═══════════════════════════════════════════════════════
+RÈGLES ABSOLUES POUR LE CODE — AUCUNE EXCEPTION
+═══════════════════════════════════════════════════════
+
+DÉFINITIONS STRICTES :
+- ARTEFACT = code complet, autonome, prêt à être copié et exécuté (8 lignes ou plus)
+  → Fichier HTML complet, composant React, script Python, API, etc.
+- EXEMPLE INLINE = 1 à 7 lignes montrant une syntaxe ou clarifiant un point dans une explication
+
+RÈGLE 1 — ARTEFACT : quand l'utiliser
+Génère un artefact (bloc de code 8+ lignes) UNIQUEMENT si :
+- L'utilisateur demande explicitement : "crée", "génère", "écris le code", "fais-moi", "programme"
+- Le code est un fichier complet qu'on peut copier-coller et exécuter directement
+- Le code fait 8 lignes non vides ou plus
+
+RÈGLE 2 — EXEMPLE INLINE : quand l'utiliser
+Si tu expliques un concept et illustres avec 1 à 7 lignes → bloc inline court.
+Ces blocs sont affichés dans le chat, PAS dans un artefact.
+
+RÈGLE 3 — NE JAMAIS MÉLANGER texte et gros blocs
+- Un artefact = UN seul bloc de code, continu, sans texte intercalé
+- Ne jamais couper un artefact en plusieurs blocs séparés par du texte
+- Ne jamais mettre du texte d'explication à l'intérieur d'un artefact
+
+RÈGLE 4 — LANGAGES VALIDES pour un artefact
+html, css, javascript, js, typescript, ts, jsx, tsx,
+python, py, java, kotlin, swift, dart, go, rust,
+cpp, c, php, sql, bash, sh, json, yaml
+
+Tout autre identifiant (sign-table, circle-canvas, geometry-canvas, horner, etc.)
+n'est PAS un artefact de code — ne jamais le traiter comme tel.
+
+EXEMPLE CORRECT :
+✅ Explication courte + exemple inline (< 8 lignes) pour illustrer un concept
+✅ Artefact complet (8+ lignes) quand l'utilisateur demande du code fonctionnel
+❌ Un bloc de 40 lignes collé au milieu d'un paragraphe d'explication
+❌ Plusieurs blocs \`\`\`code séparés par du texte dans la même réponse
 `;
 
 const NEROSIA_SYSTEM_PROMPT = `${MONDAIN_PROMPT}\n${BASE_RULES}`;
