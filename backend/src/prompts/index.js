@@ -1,5 +1,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // src/prompts/index.js — Routeur de prompts Nerosia
+// PRINCIPE : un prompt spécialisé est TOUJOURS injecté dès qu'un mot-clé
+// correspond au message. Le prompt de base seul est utilisé uniquement
+// si aucun mot-clé ne correspond (question générale hors matière).
 // ─────────────────────────────────────────────────────────────────────────────
 
 const { NEROSIA_SYSTEM_PROMPT }        = require('./base');
@@ -19,7 +22,7 @@ const { DISSERTATION_PROMPT }          = require('./dissertation');
 const { DESIGN_PROMPT }                = require('./design');
 const { PROGRAMMATION_PROMPT }         = require('./programmation');
 
-// ── Routeur principal ─────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function normalize(str) {
   return str.toLowerCase()
@@ -55,58 +58,102 @@ function hasTrigInequality(msg, msgN) {
   return (hasTrigFunc && hasIneq) || (hasTrigTerm && hasIneq);
 }
 
+// ── Table des règles par mots-clés ───────────────────────────────────────────
+
 const PROMPT_RULES = [
-  { name: 'horner',       keywords: ['hörner','horner','höner','division synthetique','tableau de horner','methode de horner'],                                                                                                                                                                                                          prompt: HORNER_PROMPT },
-  { name: 'polynomes',    keywords: ['division euclidienne','diviser par','forme canonique','completer le carre','coefficients indetermines','zero du polynome','racine du polynome','polynome du second degre','fonction polynome'],                                                                                                      prompt: POLYNOME_PROMPT },
-  { name: 'complexes',    keywords: ['nombre complexe','nombres complexes','ensemble c','z = a + ib','partie reelle','partie imaginaire','imaginaire pur','conjugue','module de z','|z|','argument','arg(z)','forme trigonometrique','forme exponentielle','formule de moivre','formule d euler'],                                        prompt: COMPLEXES_PROMPT },
-  { name: 'equations',    keywords: ['equation du second degre','discriminant','recette r1','recette r2','racines de l equation','somme des racines','produit des racines','factoriser','forme factorisee','bicarree','resoudre dans r','resoudre dans ir'],                                                                              prompt: EQUATION_PROMPT },
-  { name: 'design',       keywords: ['landing page','site vitrine','site web','design','interface','ui design','ux design','maquette','mockup','page de connexion','dashboard','tableau de bord','navbar','card','glassmorphism','dark mode','gradient','responsive','animation','composant','bouton','moderne','elegant','premium'],      prompt: DESIGN_PROMPT },
-  { name: 'programmation',keywords: ['code','programme','script','fonction','algorithme','bug','erreur','debug','api','backend','frontend','react','python','java','javascript','typescript','html','css','sql','nodejs','express'],                                                                                                        prompt: PROGRAMMATION_PROMPT },
-  { name: 'physique',     keywords: ['physique','force','vecteur','acceleration','vitesse','energie','puissance','pression','circuit','tension','courant','resistance','mcu','mruv','mrua','champ'],                                                                                                                                       prompt: PHYSIQUE_PROMPT },
-  { name: 'geometrie',    keywords: ['triangle','cercle','droite','angle','parallelogramme','vecteur','repere','coordonnees','distance','milieu','bissectrice','mediatrice','theoreme de tales','theoreme de pythagore'],                                                                                                                  prompt: GEOMETRIE_PROMPT },
-  { name: 'dissertation', keywords: ['dissertation','redaction','plan','these','antithese','synthese','introduction','conclusion','developpement','argumentation','essai'],                                                                                                                                                                prompt: DISSERTATION_PROMPT },
+  {
+    name: 'horner',
+    keywords: ['hörner','horner','höner','division synthetique','tableau de horner','methode de horner'],
+    prompt: HORNER_PROMPT
+  },
+  {
+    name: 'polynomes',
+    keywords: ['division euclidienne','diviser par','forme canonique','completer le carre','coefficients indetermines','zero du polynome','racine du polynome','polynome du second degre','fonction polynome'],
+    prompt: POLYNOME_PROMPT
+  },
+  {
+    name: 'complexes',
+    keywords: ['nombre complexe','nombres complexes','ensemble c','z = a + ib','partie reelle','partie imaginaire','imaginaire pur','conjugue','module de z','|z|','argument','arg(z)','forme trigonometrique','forme exponentielle','formule de moivre','formule d euler'],
+    prompt: COMPLEXES_PROMPT
+  },
+  {
+    name: 'equations',
+    keywords: ['equation du second degre','discriminant','recette r1','recette r2','racines de l equation','somme des racines','produit des racines','factoriser','forme factorisee','bicarree','resoudre dans r','resoudre dans ir'],
+    prompt: EQUATION_PROMPT
+  },
+  {
+    name: 'design',
+    keywords: ['landing page','site vitrine','site web','design','interface','ui design','ux design','maquette','mockup','page de connexion','dashboard','tableau de bord','navbar','card','glassmorphism','dark mode','gradient','responsive','animation','composant','bouton','moderne','elegant','premium'],
+    prompt: DESIGN_PROMPT
+  },
+  {
+    name: 'programmation',
+    keywords: ['code','programme','script','fonction','algorithme','bug','erreur','debug','api','backend','frontend','react','python','java','javascript','typescript','html','css','sql','nodejs','express'],
+    prompt: PROGRAMMATION_PROMPT
+  },
+  {
+    name: 'physique',
+    keywords: ['physique','force','vecteur','acceleration','vitesse','energie','puissance','pression','circuit','tension','courant','resistance','mcu','mruv','mrua','champ'],
+    prompt: PHYSIQUE_PROMPT
+  },
+  {
+    name: 'geometrie',
+    keywords: ['triangle','cercle','droite','angle','parallelogramme','vecteur','repere','coordonnees','distance','milieu','bissectrice','mediatrice','theoreme de tales','theoreme de pythagore'],
+    prompt: GEOMETRIE_PROMPT
+  },
+  {
+    name: 'dissertation',
+    keywords: ['dissertation','redaction','plan','these','antithese','synthese','introduction','conclusion','developpement','argumentation','essai'],
+    prompt: DISSERTATION_PROMPT
+  },
 ];
+
+// ── Routeur principal ─────────────────────────────────────────────────────────
 
 function getSystemPrompt(userMessage, webContext) {
   const msg  = userMessage.toLowerCase();
   const msgN = normalize(userMessage);
 
+  // Base toujours présente
   let systemPrompt = NEROSIA_SYSTEM_PROMPT;
+  let matched = false;
 
-  // ── Signaux combinés prioritaires ─────────────────────────────────────────
+  // ── Signaux combinés prioritaires (avant les mots-clés simples) ───────────
   const hasRac = hasRacine(msg);
+
   if (hasRac && (hasInequation(msgN) || hasSigneIneg(msg))) {
     systemPrompt += `\n\n---\n\n${MATH_IRAT_IN_PROMPT}`;
-    return finalize(systemPrompt, webContext);
-  }
-  if (hasRac && hasEquation(msgN)) {
+    matched = true;
+  } else if (hasRac && hasEquation(msgN)) {
     systemPrompt += `\n\n---\n\n${MATH_IRAT_EQ_PROMPT}`;
-    return finalize(systemPrompt, webContext);
-  }
-  if (hasFractionExpr(msg)) {
+    matched = true;
+  } else if (hasFractionExpr(msg)) {
     systemPrompt += `\n\n---\n\n${MATH_QUOTIENT_PROMPT}`;
-    return finalize(systemPrompt, webContext);
-  }
-  if (hasTrigInequality(msg, msgN)) {
+    matched = true;
+  } else if (hasTrigInequality(msg, msgN)) {
     systemPrompt += `\n\n---\n\n${MATH_TRIG_INEGALITES_PROMPT}`;
-    return finalize(systemPrompt, webContext);
-  }
-  if (hasEtudierSigne(msgN) && hasTrinomeExpr(msg) && !hasFractionExpr(msg)) {
+    matched = true;
+  } else if (hasEtudierSigne(msgN) && hasTrinomeExpr(msg) && !hasFractionExpr(msg)) {
     systemPrompt += `\n\n---\n\n${MATH_TRINOME_PROMPT}`;
-    return finalize(systemPrompt, webContext);
-  }
-  if (hasEtudierSigne(msgN) && !hasFractionExpr(msg) && !hasTrinomeExpr(msg)) {
+    matched = true;
+  } else if (hasEtudierSigne(msgN) && !hasFractionExpr(msg) && !hasTrinomeExpr(msg)) {
     systemPrompt += `\n\n---\n\n${MATH_BINOME_PROMPT}`;
-    return finalize(systemPrompt, webContext);
+    matched = true;
   }
 
-  // ── Routage par keywords ──────────────────────────────────────────────────
-  for (const rule of PROMPT_RULES) {
-    if (rule.keywords.some(kw => msgN.includes(normalize(kw)))) {
-      systemPrompt += `\n\n---\n\n${rule.prompt}`;
-      break;
+  // ── Routage par mots-clés (si aucun signal combiné n'a matché) ───────────
+  if (!matched) {
+    for (const rule of PROMPT_RULES) {
+      if (rule.keywords.some(kw => msgN.includes(normalize(kw)))) {
+        systemPrompt += `\n\n---\n\n${rule.prompt}`;
+        matched = true;
+        break;
+      }
     }
   }
+
+  // ── Si aucun mot-clé ne correspond → prompt de base seul (question générale)
+  // Aucune injection supplémentaire : NEROSIA_SYSTEM_PROMPT suffit.
 
   return finalize(systemPrompt, webContext);
 }
