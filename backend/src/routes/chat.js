@@ -1,82 +1,44 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// src/routes/chat.js — Route POST /api/chat (streaming SSE)
+// ─────────────────────────────────────────────────────────────────────────────
+
 const express = require('express');
-const router  = express.Router();
-const { openRouterFetch }               = require('../openrouter');
-const { getSystemPrompt }               = require('../prompts');
-const { runSearchAgent }                = require('../agents/searchAgents');
+const router = express.Router();
+const { openRouterFetch } = require('../openrouter');
+const { getSystemPrompt } = require('../prompts');
+const { runSearchAgent } = require('../agents/searchAgents');
 const { runCodePipeline, needsCodePipeline } = require('../agents/codeAgents');
 
-// ── Requêtes qui ne nécessitent PAS de recherche web ─────────────────────────
-const NO_SEARCH_PATTERNS = [
-  /^(bonjour|salut|hello|hi|hey|bonsoir|coucou)\b/i,
-  /^(merci|thanks|thank you)\b/i,
-  /^\d[\d\s+\-*/^().,]*$/,
-  /^(résume|reformule|traduis|corrige|améliore)\s/i,
-  /^(continue|vas-y|ok|oui|non|d'accord)\b/i,
-  /^(quel est ton nom|qui es-tu|tu es qui|what are you)\b/i,
-];
-
-function needsSearch(query) {
-  const q = query.trim();
-  if (q.length < 8) return false;
-  return !NO_SEARCH_PATTERNS.some(re => re.test(q));
-}
-
-function getAgentLabel(agent) {
-  switch (agent) {
-    case 'image':     return 'images';
-    case 'academic':  return 'articles académiques';
-    case 'reddit':    return 'discussions Reddit';
-    case 'wikipedia': return 'articles Wikipedia';
-    default:          return 'sources web';
-  }
-}
-
-function buildSearchSummary(searchResult) {
-  if (!searchResult || searchResult.sources.length === 0) return null;
-  const { agent, sources } = searchResult;
-  const count  = sources.length;
-  const label  = getAgentLabel(agent);
-  const titles = sources
-    .slice(0, 3)
-    .map(s => `• ${s.title.slice(0, 60)}${s.title.length > 60 ? '…' : ''}`)
-    .join('\n');
-  return `J'ai trouvé ${count} ${label} :\n${titles}${count > 3 ? `\n• … et ${count - 3} de plus` : ''}\n\nJe synthétise maintenant…`;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// STRATÉGIE DE STREAMING V4
-//
-// Objectif : streaming live visible + done:true garanti côté frontend.
-//
-// Principe :
-//   ① Envoi SYSTÉMATIQUE du chunk courant à chaque token
-//      → le frontend voit le bloc se construire en live (streaming visible ✓)
-//
-//   ② Quand un bloc ``` vient de se fermer (prevHadOpenBlock && !currHasOpen),
-//      on renvoie le même contenu via setImmediate
-//      → laisse le ① être traité d'abord, puis force done:true côté frontend
-//        via extractStreamingFiles() qui trouve maintenant tous les blocs fermés
-//
-//   ③ Envoi final après la fin du stream
-//      → garantit le dernier état même si le ``` fermant était le tout dernier token
-// ─────────────────────────────────────────────────────────────────────────────
-
 /**
- * Retourne true s'il reste au moins un bloc ``` ouvert (sans fermeture correspondante).
+ * POST /api/chat
+ *
+ * Body :
+ * {
+ *   message: string,          — message de l'utilisateur
+ *   history: [{role, content}],— historique de la conversation
+ *   model: "opus"|"sonnet"|"haiku",
+ *   deepResearch: boolean,     — true = pipeline multi-agents
+ *   webSearch: boolean,        — true = forcer la recherche web
+ *   max_tokens?: number,
+ *   temperature?: number,
+ * }
+ *
+ * Réponse SSE :
+ *   data: {"type":"chunk","content":"..."}\n\n       — streaming texte
+ *   data: {"type":"thinkingSteps","steps":[...]}\n\n — étapes de réflexion
+ *   data: {"type":"sources","sources":[...]}\n\n     — sources de recherche
+ *   data: {"type":"pipeline","steps":[...]}\n\n      — avancement pipeline code
+ *   data: {"type":"done","modelUsed":"..."}\n\n      — fin
+ *   data: {"type":"error","message":"..."}\n\n       — erreur
  */
-function hasOpenCodeBlock(text) {
-  const withoutClosed = text.replace(/```[^\n`]*\n[\s\S]*?```/g, '');
-  return /```[^\n`]+\n[\s\S]+$/.test(withoutClosed);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-
 router.post('/', async (req, res) => {
+  // FIX 1 : webSearch est maintenant lu depuis req.body
   const {
     message,
-    history      = [],
-    model        = 'opus',
+    history     = [],
+    model       = 'opus',
     deepResearch = false,
+    webSearch   = false,   // ← FIX : était ignoré avant
     max_tokens,
     temperature,
   } = req.body;
@@ -85,17 +47,24 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'message requis' });
   }
 
+  // ── Headers SSE ────────────────────────────────────────────────────────────
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-  const done = () => { res.write('data: [DONE]\n\n'); res.end(); };
+  const send = (data) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  const done = () => {
+    res.write('data: [DONE]\n\n');
+    res.end();
+  };
 
   try {
-    // ── Pipeline code (deep research) ────────────────────────────────────────
+    // ── Mode flash (deepResearch) = pipeline multi-agents ──────────────────
     if (deepResearch && needsCodePipeline(message)) {
       await runCodePipeline(message, (agentSteps) => {
         send({ type: 'pipeline', steps: agentSteps });
@@ -106,123 +75,81 @@ router.post('/', async (req, res) => {
       return;
     }
 
-    // ── Recherche systématique ────────────────────────────────────────────────
+    // ── Recherche web ───────────────────────────────────────────────────────
+    // FIX 2 : on passe webSearch à runSearchAgent pour forcer la recherche
+    // si l'utilisateur l'a activée, même sans mots-clés déclencheurs
     let systemContext = '';
-    let sources       = [];
+    let sources = [];
 
-    if (needsSearch(message)) {
-      send({ type: 'searching', status: 'loading', label: 'Recherche en cours…', icon: 'globe' });
-
-      try {
-        const searchResult = await runSearchAgent(message);
-
-        if (searchResult?.sources?.length > 0 || searchResult?.images?.length > 0) {
-          sources       = searchResult.sources;
-          systemContext = searchResult.contextBlock;
-
-          if (sources.length > 0) {
-            send({ type: 'sources', sources, agent: searchResult.agent });
-          }
-          if (searchResult.images?.length > 0) {
-            send({ type: 'images', images: searchResult.images });
-          }
-
-          const summary = buildSearchSummary(searchResult);
-          send({ type: 'searching', status: 'done', label: summary, icon: 'globe', count: sources.length, agent: searchResult.agent });
-
-        } else {
-          send({ type: 'searching', status: 'done', label: 'Aucun résultat trouvé — je réponds avec mes connaissances.', icon: 'globe' });
-        }
-
-      } catch (err) {
-        console.warn('[chat] Recherche échouée :', err.message);
-        send({ type: 'searching', status: 'error', label: 'Recherche indisponible — réponse directe.', icon: 'globe' });
-      }
+    const searchResult = await runSearchAgent(message, { forceSearch: webSearch });
+    if (searchResult) {
+      sources = searchResult.sources;
+      systemContext = searchResult.contextBlock;
+      send({ type: 'sources', sources });
     }
 
-    // ── Construction du prompt ────────────────────────────────────────────────
+    // ── Appel OpenRouter avec streaming SSE ────────────────────────────────
     const systemPrompt = getSystemPrompt(message, systemContext || undefined);
 
+    // FIX 3 : filtrage strict de l'historique
+    // - on exclut les messages vides (content vide ou whitespace)
+    // - on s'assure que chaque entrée a bien role + content non vide
+    // Côté frontend le message courant n'est plus dans history (fix ChatContext)
+    // mais on double-vérifie ici côté backend pour être safe
     const previousMessages = (history ?? [])
-      .filter(m => m.role && m.content)
+      .filter(m =>
+        m.role &&
+        typeof m.content === 'string' &&
+        m.content.trim().length > 0
+      )
       .map(m => ({ role: m.role, content: m.content }));
 
-    // ── Appel LLM en streaming ────────────────────────────────────────────────
-    let streamedContent  = '';
-    // true si le chunk PRÉCÉDENT avait un bloc ``` ouvert non fermé
-    let prevHadOpenBlock = false;
+    let streamedContent = '';
 
     const result = await openRouterFetch({
-      model:       model ?? 'opus',
-      max_tokens:  max_tokens ?? 8192,
+      model: model ?? 'opus',
+      max_tokens: max_tokens ?? 8192,
       temperature: temperature ?? 0.7,
       messages: [
         { role: 'system', content: systemPrompt },
         ...previousMessages,
         { role: 'user', content: message },
       ],
-
       onChunk: (chunk) => {
-        streamedContent = chunk;
+        streamedContent += chunk;
 
-        // ── Gestion bloc <thinking> ─────────────────────────────────────
+        // Étapes thinking en temps réel
         const thinkMatch = streamedContent.match(/<thinking>([\s\S]*)/);
         if (thinkMatch) {
           const partial = thinkMatch[1];
-          const steps   = parseStepsFromPartial(partial);
+          const steps = parseStepsFromPartial(partial);
           if (steps.length > 0) {
             const thinkingComplete = streamedContent.includes('</thinking>');
             send({
-              type:  'thinkingSteps',
+              type: 'thinkingSteps',
               steps: steps.map((s, i) => ({
                 label: s.title,
-                icon:  'think',
-                done:  thinkingComplete || i < steps.length - 1,
+                icon: 'think',
+                done: thinkingComplete || i < steps.length - 1,
               })),
             });
           }
         }
 
-        if (!streamedContent.includes('</thinking>')) return;
-
-        const displayContent = streamedContent
-          .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
-          .trimStart();
-
-        if (!displayContent) return;
-
-        // ── STRATÉGIE V4 ─────────────────────────────────────────────────
-        //
-        // ① Envoi SYSTÉMATIQUE à chaque token → streaming visible côté app
-        send({ type: 'chunk', content: displayContent });
-
-        // ② Détection de la fermeture d'un bloc ```
-        //    prevHadOpenBlock vrai + currHasOpen faux = le ``` fermant
-        //    vient d'arriver dans ce chunk.
-        //    On renvoie via setImmediate pour laisser le ① être traité
-        //    d'abord, puis forcer done:true via extractStreamingFiles().
-        const currHasOpen = hasOpenCodeBlock(displayContent);
-
-        if (prevHadOpenBlock && !currHasOpen) {
-          setImmediate(() => {
-            send({ type: 'chunk', content: displayContent });
-          });
+        // Contenu visible (masque le bloc <thinking>)
+        let displayContent = streamedContent;
+        const thinkEnd = streamedContent.indexOf('</thinking>');
+        if (thinkEnd !== -1) {
+          displayContent = streamedContent.slice(thinkEnd + '</thinking>'.length).trimStart();
+        } else if (streamedContent.includes('<thinking>')) {
+          displayContent = '';
         }
 
-        prevHadOpenBlock = currHasOpen;
+        if (displayContent) {
+          send({ type: 'chunk', content: displayContent });
+        }
       },
     });
-
-    // ── ③ Envoi final ────────────────────────────────────────────────────────
-    // Garantit que le dernier état (tous blocs fermés) est bien reçu,
-    // même si le ``` fermant était le tout dernier token du stream.
-    const finalDisplay = streamedContent
-      .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
-      .trimStart();
-
-    if (finalDisplay) {
-      send({ type: 'chunk', content: finalDisplay });
-    }
 
     send({ type: 'done', modelUsed: result.modelUsed });
     done();
@@ -234,10 +161,11 @@ router.post('/', async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function parseStepsFromPartial(partial) {
-  const completions = [partial, partial + ']}', partial + '"]}', partial + '"}]}'];
+  // Essai JSON
+  const completions = [partial, partial + ']}', partial + '"]}', partial + '"]}'];
   for (const attempt of completions) {
     try {
       const parsed = JSON.parse(attempt.trim());
@@ -246,11 +174,11 @@ function parseStepsFromPartial(partial) {
       }
     } catch {}
   }
+  // Regex fallback
   const matches = [...partial.matchAll(/"title"\s*:\s*"([^"\\]+)"/g)];
   if (matches.length > 0) return matches.map(m => ({ title: m[1] }));
-  const lines = partial.split('\n')
-    .map(l => l.replace(/^[-*•#>\d.)\s]+/, '').trim())
-    .filter(l => l.length > 4);
+  // Texte libre
+  const lines = partial.split('\n').map(l => l.replace(/^[-*•#>\d.)\s]+/, '').trim()).filter(l => l.length > 4);
   if (lines.length > 0) return lines.slice(0, 4).map(l => ({ title: l.slice(0, 80) }));
   return [];
 }
