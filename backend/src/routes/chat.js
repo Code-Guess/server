@@ -44,6 +44,50 @@ function buildSearchSummary(searchResult) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CORRECTION PRINCIPALE : Gestion du streaming de blocs de code
+//
+// Problème original :
+//   onChunk envoie le contenu accumulé à chaque token. Quand la réponse contient
+//   un bloc ``` ... ```, le frontend reçoit des chunks où le ``` fermant n'est
+//   pas encore arrivé → extractStreamingFiles() ne peut pas marquer done:true.
+//   L'artefact reste bloqué en "refresh-cw" et affiche le code en bloc brut.
+//
+// Solution :
+//   On distingue deux modes d'envoi :
+//   1. HORS bloc code    → envoi immédiat chunk par chunk (réactivité maximale)
+//   2. DANS un bloc code → on bufferise et on n'envoie QU'AU MOMENT où le bloc
+//      est fermé (``` de fermeture détecté). Cela garantit que le frontend
+//      reçoit toujours des blocs complets → done:true systématiquement.
+//
+//   Exception : si le modèle est encore en train d'écrire et qu'on veut quand
+//   même afficher la progression, on envoie un "chunk preview" sans le bloc
+//   incomplet, et on re-envoie avec le bloc complet une fois fermé.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Retourne true si le texte contient au moins un bloc ``` ouvert non fermé.
+ * Un bloc ouvert = un ``` suivi d'un nom de langage + contenu, sans ``` de fermeture.
+ */
+function hasOpenCodeBlock(text) {
+  // Retire tous les blocs fermés
+  const withoutClosed = text.replace(/```[^\n`]*\n[\s\S]*?```/g, '');
+  // S'il reste un ``` orphelin avec du contenu
+  return /```[^\n`]+\n[\s\S]+$/.test(withoutClosed);
+}
+
+/**
+ * Retourne le texte sans le dernier bloc de code ouvert (pour envoi partiel).
+ * Permet d'afficher le texte qui précède le bloc en cours de génération.
+ */
+function stripLastOpenBlock(text) {
+  // Trouve la position du dernier ``` ouvrant sans fermeture
+  const withoutClosed = text.replace(/```[^\n`]*\n[\s\S]*?```/g, (m) => '\x00'.repeat(m.length));
+  const openIdx = withoutClosed.search(/```[^\n`]+\n[\s\S]+$/);
+  if (openIdx === -1) return text;
+  return text.slice(0, openIdx).trimEnd();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 router.post('/', async (req, res) => {
   const {
@@ -100,25 +144,14 @@ router.post('/', async (req, res) => {
           sources       = searchResult.sources;
           systemContext = searchResult.contextBlock;
 
-          // ── Sources texte (cartes cliquables) ────────────────────────────
           if (sources.length > 0) {
-            send({
-              type:    'sources',
-              sources,
-              agent:   searchResult.agent,
-            });
+            send({ type: 'sources', sources, agent: searchResult.agent });
           }
 
-          // ── Images séparées — event dédié ─────────────────────────────────
-          // Envoyé indépendamment des sources texte, toujours présent si dispo
           if (searchResult.images?.length > 0) {
-            send({
-              type:   'images',
-              images: searchResult.images,
-            });
+            send({ type: 'images', images: searchResult.images });
           }
 
-          // ── Résumé affiché avant la réponse LLM ──────────────────────────
           const summary = buildSearchSummary(searchResult);
           send({
             type:   'searching',
@@ -157,7 +190,9 @@ router.post('/', async (req, res) => {
       .map(m => ({ role: m.role, content: m.content }));
 
     // ── Appel LLM en streaming ────────────────────────────────────────────────
-    let streamedContent = '';
+    let streamedContent    = '';
+    let lastSentContent    = ''; // dernier contenu envoyé au frontend
+    let codeBlockOpen      = false; // true = on est dans un bloc ``` non fermé
 
     const result = await openRouterFetch({
       model:       model ?? 'opus',
@@ -168,9 +203,11 @@ router.post('/', async (req, res) => {
         ...previousMessages,
         { role: 'user', content: message },
       ],
+
       onChunk: (chunk) => {
         streamedContent = chunk;
 
+        // ── Gestion du bloc <thinking> ────────────────────────────────────
         const thinkMatch = streamedContent.match(/<thinking>([\s\S]*)/);
         if (thinkMatch) {
           const partial = thinkMatch[1];
@@ -190,15 +227,55 @@ router.post('/', async (req, res) => {
 
         if (!streamedContent.includes('</thinking>')) return;
 
+        // ── Nettoyage du bloc thinking ────────────────────────────────────
         let displayContent = streamedContent
           .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
           .trimStart();
 
-        if (displayContent) {
-          send({ type: 'chunk', content: displayContent });
+        if (!displayContent) return;
+
+        // ── CORRECTION : gestion des blocs de code ouverts ────────────────
+        //
+        // Si le contenu contient un bloc ``` non fermé :
+        //   → on envoie uniquement la partie AVANT le bloc ouvert (texte pur)
+        //   → le bloc lui-même sera envoyé une seule fois, complet, quand
+        //     le ``` de fermeture arrivera
+        //
+        // Si le contenu ne contient PAS de bloc ouvert (tout est fermé) :
+        //   → envoi normal du contenu complet
+        //
+        if (hasOpenCodeBlock(displayContent)) {
+          codeBlockOpen = true;
+
+          // Envoie la partie avant le bloc ouvert (texte intro, etc.)
+          const textBeforeBlock = stripLastOpenBlock(displayContent);
+          if (textBeforeBlock && textBeforeBlock !== lastSentContent) {
+            lastSentContent = textBeforeBlock;
+            send({ type: 'chunk', content: textBeforeBlock });
+          }
+          // On N'ENVOIE PAS le bloc incomplet → le frontend ne verra jamais
+          // un bloc à moitié écrit
+        } else {
+          // Tous les blocs sont fermés (ou pas de blocs du tout)
+          if (codeBlockOpen || displayContent !== lastSentContent) {
+            codeBlockOpen   = false;
+            lastSentContent = displayContent;
+            send({ type: 'chunk', content: displayContent });
+          }
         }
       },
     });
+
+    // ── Envoi final garanti : s'assure que le contenu complet est bien envoyé
+    // même si le dernier chunk n'a pas déclenché un envoi (ex: fin de stream
+    // avec un bloc qui se ferme exactement au dernier token)
+    const finalDisplay = streamedContent
+      .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
+      .trimStart();
+
+    if (finalDisplay && finalDisplay !== lastSentContent) {
+      send({ type: 'chunk', content: finalDisplay });
+    }
 
     send({ type: 'done', modelUsed: result.modelUsed });
     done();
