@@ -43,11 +43,6 @@ function buildSearchSummary(searchResult) {
   return `J'ai trouvé ${count} ${label} :\n${titles}${count > 3 ? `\n• … et ${count - 3} de plus` : ''}\n\nJe synthétise maintenant…`;
 }
 
-function hasOpenCodeBlock(text) {
-  const withoutClosed = text.replace(/```[^\n`]*\n[\s\S]*?```/g, '');
-  return /```[^\n`]+\n[\s\S]+$/.test(withoutClosed);
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.post('/', async (req, res) => {
@@ -103,7 +98,7 @@ router.post('/', async (req, res) => {
             send({ type: 'sources', sources, agent: searchResult.agent });
           }
           if (searchResult.images?.length > 0) {
-            send({ type: 'images', images: searchResult.images });
+            send({ type: 'images', images: searchResult.images, intent: searchResult.imageIntent ?? 'none' });
           }
 
           const summary = buildSearchSummary(searchResult);
@@ -122,10 +117,6 @@ router.post('/', async (req, res) => {
     // ── Construction du prompt ────────────────────────────────────────────────
     const systemPrompt = getSystemPrompt(message, systemContext || undefined);
 
-    // ── DEBUG — vérifie que le prompt est bien construit ─────────────────────
-    console.log('[DEBUG] systemPrompt length:', systemPrompt.length);
-    console.log('[DEBUG] systemPrompt début:', systemPrompt.slice(0, 300));
-
     const previousMessages = (history ?? [])
       .filter(m => m.role && m.content)
       .map(m => ({
@@ -142,16 +133,8 @@ router.post('/', async (req, res) => {
       { role: 'user', content: message },
     ];
 
-    // ── DEBUG — vérifie les messages envoyés au modèle ───────────────────────
-    console.log('[DEBUG] messages count:', messages.length);
-    console.log('[DEBUG] messages[0].role:', messages[0].role);
-    console.log('[DEBUG] messages[0].content début:', messages[0].content.slice(0, 150));
-    console.log('[DEBUG] messages[last].role:', messages[messages.length - 1].role);
-    console.log('[DEBUG] messages[last].content:', messages[messages.length - 1].content.slice(0, 100));
-
     // ── Appel LLM en streaming ────────────────────────────────────────────────
-    let streamedContent  = '';
-    let prevHadOpenBlock = false;
+    let streamedContent = '';
 
     const result = await openRouterFetch({
       model:       model ?? 'opus',
@@ -162,7 +145,7 @@ router.post('/', async (req, res) => {
       onChunk: (chunk) => {
         streamedContent = chunk;
 
-        // ── Gestion bloc <thinking> ─────────────────────────────────────
+        // ── Gestion bloc <thinking> ──────────────────────────────────────────
         const thinkMatch = streamedContent.match(/<thinking>([\s\S]*)/);
         if (thinkMatch) {
           const partial = thinkMatch[1];
@@ -180,6 +163,7 @@ router.post('/', async (req, res) => {
           }
         }
 
+        // Attendre la fin du bloc <thinking> avant d'envoyer le contenu affiché
         if (!streamedContent.includes('</thinking>')) return;
 
         const displayContent = streamedContent
@@ -188,20 +172,12 @@ router.post('/', async (req, res) => {
 
         if (!displayContent) return;
 
-        // ── STRATÉGIE V4 ─────────────────────────────────────────────────
+        // ── Envoi unique du chunk cumulé ─────────────────────────────────────
         send({ type: 'chunk', content: displayContent });
-
-        const currHasOpen = hasOpenCodeBlock(displayContent);
-        if (prevHadOpenBlock && !currHasOpen) {
-          setImmediate(() => {
-            send({ type: 'chunk', content: displayContent });
-          });
-        }
-        prevHadOpenBlock = currHasOpen;
       },
     });
 
-    // ── Envoi final ───────────────────────────────────────────────────────────
+    // ── Envoi final (flush complet au cas où le dernier chunk n'a pas été envoyé) ──
     const finalDisplay = streamedContent
       .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
       .trimStart();
