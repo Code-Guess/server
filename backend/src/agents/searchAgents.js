@@ -7,6 +7,36 @@ const IMAGE_KW     = ['image','photo','illustration','montre','à quoi ressemble
 const WIKIPEDIA_KW = ['wikipedia','définition',"c'est quoi",'kesako','histoire de','biographie','origine de',"qu'est-ce que","qu'est ce que",'signifie','veut dire'];
 const REDDIT_KW    = ['reddit','expérience','forum','communauté','gens pensent',"retour d'expérience",'témoignage','que pensent les gens','avis reddit','opinion reddit','avis des gens'];
 
+// ── Catégories où les images N'apportent RIEN ─────────────────────────────────
+const NO_IMAGE_KW = [
+  'équation','inéquation','discriminant','racine','polynôme','dérivée',
+  'intégrale','limite','matrice','trinôme','binôme','factori',
+  'développer','simplifier','résoudre','calculer','démontrer','prouver',
+  'tableau de signes','tableau de valeurs','ensemble de définition',
+  'code','programme','script','fonction','algorithme','bug','erreur','debug',
+  'api','backend','frontend','react','python','javascript','typescript',
+  'html','css','sql','nodejs','express','composant',
+  'dissertation','plan dialectique','thèse','antithèse','synthèse',
+  'argumentation','commenter','rédige','introduction','conclusion',
+  'signifie','veut dire','expliquer','pourquoi','comment',
+  'loi de','formule','calculer la force','calculer la vitesse',
+];
+
+// ── Catégories où les images ont de la valeur ─────────────────────────────────
+const YES_IMAGE_KW = [
+  'qui est','biographie','portrait','président','roi','reine','fondateur',
+  'inventeur','scientifique','artiste','acteur','chanteur','musicien',
+  'joueur','athlète','politicien','philosophe','écrivain','auteur',
+  'pays','ville','capitale','monument','bâtiment','tour','pont','fleuve',
+  'montagne','continent','carte','région','quartier','musée','cathédrale',
+  'animal','espèce','plante','fleur','arbre','insecte','oiseau','poisson',
+  'mammifère','reptile','paysage','nature','forêt','océan','désert',
+  'voiture','téléphone','appareil','machine','outil','instrument',
+  'produit','objet','œuvre','tableau','sculpture','architecture',
+  'événement','catastrophe','manifestation','inauguration','lancement',
+  'match','compétition','cérémonie','festival','exposition',
+];
+
 function hasProperNoun(query) {
   return /[A-ZÀÂÉÈÊËÎÏÔÙÛÜ][a-zàâéèêëîïôùûü]+ [A-ZÀÂÉÈÊËÎÏÔÙÛÜ][a-zàâéèêëîïôùûü]+/.test(query);
 }
@@ -18,6 +48,24 @@ function detectAgent(query) {
   if (REDDIT_KW.some(k => q.includes(k)))    return 'reddit';
   if (WIKIPEDIA_KW.some(k => q.includes(k))) return 'wikipedia';
   return 'web';
+}
+
+// ── Décide si les images sont pertinentes pour cette question ─────────────────
+function detectImageIntent(query) {
+  const q = query.toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+  // Veto explicite : question abstraite/formelle → jamais d'images
+  if (NO_IMAGE_KW.some(kw => q.includes(kw))) return 'none';
+
+  // Signal positif : sujet visuel confirmé
+  if (YES_IMAGE_KW.some(kw => q.includes(kw))) return 'show';
+
+  // Agent image explicite
+  if (IMAGE_KW.some(kw => q.includes(kw))) return 'show';
+
+  // Par défaut : pas d'images
+  return 'none';
 }
 
 async function rephraseForSearch(query, lang = 'français') {
@@ -43,18 +91,12 @@ async function rephraseForSearch(query, lang = 'français') {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Recherche d'images parallèle — appelée par TOUS les agents sauf 'image'
-// Retourne un tableau de { title, url, img_src, type: 'image' }
-// ─────────────────────────────────────────────────────────────────────────────
-
+// ── fetchImagesForQuery ───────────────────────────────────────────────────────
 async function fetchImagesForQuery(query) {
-  // On reformule en anglais pour de meilleurs résultats Wikimedia
   const q = await rephraseForSearch(query, 'anglais');
   try {
     const images = await wikimediaSearch(q);
     if (images.length > 0) return images;
-    // Fallback : Serper images si dispo
     return serperImageSearch(q);
   } catch (err) {
     console.warn('[fetchImagesForQuery] error:', err.message);
@@ -76,12 +118,7 @@ async function serperImageSearch(query) {
     return (data.images ?? [])
       .filter(img => img.imageUrl && img.title)
       .slice(0, 8)
-      .map(img => ({
-        title:   img.title,
-        url:     img.link ?? img.imageUrl,
-        img_src: img.imageUrl,
-        type:    'image',
-      }));
+      .map(img => ({ title: img.title, url: img.link ?? img.imageUrl, img_src: img.imageUrl, type: 'image' }));
   } catch (err) {
     console.warn('[serperImageSearch] error:', err.message);
     return [];
@@ -89,13 +126,13 @@ async function serperImageSearch(query) {
 }
 
 // ── Agent Web ─────────────────────────────────────────────────────────────────
-
 async function runWebAgent(query) {
-  // Sources texte + images en parallèle
-  const [sources, images] = await Promise.all([
-    rephraseForSearch(query, 'français').then(q => serperSearch(q)),
-    fetchImagesForQuery(query),
-  ]);
+  const intent = detectImageIntent(query);
+
+  const tasks = [rephraseForSearch(query, 'français').then(q => serperSearch(q))];
+  if (intent === 'show') tasks.push(fetchImagesForQuery(query));
+
+  const [sources, images = []] = await Promise.all(tasks);
 
   const contextBlock = sources.length > 0
     ? `\n\n🌐 Résultats web en temps réel :\n${sources.map((s, i) => `[${i+1}] ${s.title}\n${s.snippet ?? ''}\n${s.url}`).join('\n\n')}\n\nBasé-toi sur ces résultats récents. Réponds en français. Cite les sources avec [numéro].`
@@ -104,7 +141,8 @@ async function runWebAgent(query) {
   return {
     agent: 'web',
     sources,
-    images,   // ← NOUVEAU — images indépendantes
+    images,
+    imageIntent:   intent,
     contextBlock,
     thinkingLabel: sources.length > 0 ? `${sources.length} source(s) web` : 'Réponse directe',
   };
@@ -127,12 +165,7 @@ async function serperSearch(query) {
     const sources = [];
 
     if (data.answerBox?.answer || data.answerBox?.snippet) {
-      sources.push({
-        title: data.answerBox.title ?? query,
-        url: data.answerBox.link ?? '',
-        snippet: data.answerBox.answer ?? data.answerBox.snippet,
-        type: 'web', featured: true,
-      });
+      sources.push({ title: data.answerBox.title ?? query, url: data.answerBox.link ?? '', snippet: data.answerBox.answer ?? data.answerBox.snippet, type: 'web', featured: true });
     }
     for (const r of (data.organic ?? [])) {
       sources.push({
@@ -167,9 +200,8 @@ async function duckduckgoInstantAnswer(query) {
 }
 
 // ── Agent Image ───────────────────────────────────────────────────────────────
-
 async function runImageAgent(query) {
-  const q = await rephraseForSearch(query, 'anglais');
+  const q      = await rephraseForSearch(query, 'anglais');
   const images = await wikimediaSearch(q);
 
   const contextBlock = images.length > 0
@@ -177,9 +209,10 @@ async function runImageAgent(query) {
     : '\n\nAucune image trouvée.';
 
   return {
-    agent: 'image',
-    sources: [],   // pas de sources texte pour cet agent
-    images,        // ← toutes les images dans le champ dédié
+    agent:         'image',
+    sources:       [],
+    images,
+    imageIntent:   images.length > 0 ? 'show' : 'none',
     contextBlock,
     thinkingLabel: images.length > 0 ? `${images.length} image(s)` : 'Aucune image',
   };
@@ -257,22 +290,18 @@ async function wikimediaFallbackFromWikipedia(query) {
 }
 
 // ── Agent Academic ────────────────────────────────────────────────────────────
-
 async function runAcademicAgent(query) {
-  // Sources académiques + images en parallèle
-  const [sources, images] = await Promise.all([
-    rephraseForSearch(query, 'anglais').then(q => semanticScholarSearch(q)),
-    fetchImagesForQuery(query),
-  ]);
+  const sources = await rephraseForSearch(query, 'anglais').then(q => semanticScholarSearch(q));
 
   const contextBlock = sources.length > 0
     ? `\n\n📚 Articles académiques :\n${sources.map((s, i) => `[${i+1}] ${s.title}\n${s.snippet ?? ''}\n${s.url}`).join('\n\n')}\n\nBasé-toi sur ces publications. Réponds en français. Cite avec [numéro].`
     : '';
 
   return {
-    agent: 'academic',
+    agent:         'academic',
     sources,
-    images,
+    images:        [],
+    imageIntent:   'none',
     contextBlock,
     thinkingLabel: sources.length > 0 ? `${sources.length} article(s)` : 'Aucun article',
   };
@@ -322,12 +351,7 @@ async function arxivSearch(query) {
       const summary = entry.match(/<summary>([\s\S]*?)<\/summary>/)?.[1]?.trim().replace(/\s+/g, ' ') ?? '';
       const link    = entry.match(/<id>([\s\S]*?)<\/id>/)?.[1]?.trim() ?? '';
       const authors = [...entry.matchAll(/<name>([\s\S]*?)<\/name>/g)].slice(0, 2).map(m => m[1]).join(', ');
-      return {
-        title,
-        url:     link.replace('http://', 'https://'),
-        snippet: `${summary.slice(0, 200)}…${authors ? ` — ${authors}` : ''}`,
-        type:    'academic',
-      };
+      return { title, url: link.replace('http://', 'https://'), snippet: `${summary.slice(0, 200)}…${authors ? ` — ${authors}` : ''}`, type: 'academic' };
     }).filter(s => s.title && s.url);
   } catch (err) {
     console.warn('[AcademicAgent] arXiv error:', err.message);
@@ -336,21 +360,18 @@ async function arxivSearch(query) {
 }
 
 // ── Agent Reddit ──────────────────────────────────────────────────────────────
-
 async function runRedditAgent(query) {
-  const [sources, images] = await Promise.all([
-    rephraseForSearch(query, 'français ou anglais').then(q => redditSearch(q)),
-    fetchImagesForQuery(query),
-  ]);
+  const sources = await rephraseForSearch(query, 'français ou anglais').then(q => redditSearch(q));
 
   const contextBlock = sources.length > 0
     ? `\n\n💬 Discussions Reddit :\n${sources.map((s, i) => `[${i+1}] ${s.title}\n${s.snippet ?? ''}`).join('\n\n')}\n\nSynthétise les opinions en français. Cite avec [numéro].`
     : '';
 
   return {
-    agent: 'reddit',
+    agent:         'reddit',
     sources,
-    images,
+    images:        [],
+    imageIntent:   'none',
     contextBlock,
     thinkingLabel: sources.length > 0 ? `${sources.length} discussion(s)` : 'Aucune discussion',
   };
@@ -383,21 +404,23 @@ async function redditSearch(query) {
 }
 
 // ── Agent Wikipedia ───────────────────────────────────────────────────────────
-
 async function runWikipediaAgent(query) {
-  const [sources, images] = await Promise.all([
-    rephraseForSearch(query, 'français').then(q => wikipediaSearch(q)),
-    fetchImagesForQuery(query),
-  ]);
+  const intent = detectImageIntent(query);
+
+  const tasks = [rephraseForSearch(query, 'français').then(q => wikipediaSearch(q))];
+  if (intent === 'show') tasks.push(fetchImagesForQuery(query));
+
+  const [sources, images = []] = await Promise.all(tasks);
 
   const contextBlock = sources.length > 0
     ? `\n\n📖 Résultats Wikipedia :\n${sources.map((s, i) => `[${i+1}] ${s.title}\n${s.snippet ?? ''}`).join('\n\n')}\n\nRéponds en français basé sur ces informations. Cite avec [numéro].`
     : '';
 
   return {
-    agent: 'wikipedia',
+    agent:         'wikipedia',
     sources,
     images,
+    imageIntent:   intent,
     contextBlock,
     thinkingLabel: sources.length > 0 ? `${sources.length} article(s) Wikipedia` : 'Aucun article',
   };
@@ -445,16 +468,15 @@ async function wikipediaSearch(query) {
 }
 
 // ── Export principal ──────────────────────────────────────────────────────────
-
 async function runSearchAgent(query, forceAgent) {
   const agent = forceAgent ?? detectAgent(query);
   switch (agent) {
-    case 'image':    return runImageAgent(query);
-    case 'academic': return runAcademicAgent(query);
-    case 'reddit':   return runRedditAgent(query);
-    case 'wikipedia':return runWikipediaAgent(query);
+    case 'image':     return runImageAgent(query);
+    case 'academic':  return runAcademicAgent(query);
+    case 'reddit':    return runRedditAgent(query);
+    case 'wikipedia': return runWikipediaAgent(query);
     case 'web':
-    default:         return runWebAgent(query);
+    default:          return runWebAgent(query);
   }
 }
 
