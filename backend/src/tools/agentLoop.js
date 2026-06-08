@@ -16,7 +16,32 @@
 const { executeCode } = require('../sandbox');
 const { TOOLS }       = require('./definitions');
 
-const MAX_TOOL_ROUNDS = 6; // max aller-retours tool avant de forcer la réponse finale
+const MAX_TOOL_ROUNDS = 6;
+
+// ── Patterns qui déclenchent la boucle agent ──────────────────────────────────
+const AGENT_LOOP_PATTERNS = [
+  /\bexécute?\b/i,
+  /\blance\b/i,
+  /\bcalcule?\b/i,
+  /\bteste?\b/i,
+  /\bécris?\s+(un|le|du)?\s*code\b/i,
+  /\bfais\s+tourner\b/i,
+  /\brun\b/i,
+  /\bscript\b/i,
+  /\bprogramme?\b/i,
+  /\bgenère?\s+(un|le|du)?\s*(fichier|code|script)\b/i,
+  /\bmodifie?\s+(le|ce|mon)?\s*fichier\b/i,
+  /\bedit[_\s]file\b/i,
+];
+
+/**
+ * Détecte si la requête nécessite la boucle agent (execute_code / edit_file)
+ */
+function needsAgentLoop(query) {
+  return AGENT_LOOP_PATTERNS.some(re => re.test(query.trim()));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Envoie un event SSE au client
@@ -55,7 +80,7 @@ function mergeToolCallDeltas(toolCallsAcc) {
 async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperature }) {
   const history = [...messages];
 
-  let accumulatedContent = ''; // contenu textuel total accumulé sur tous les rounds
+  let accumulatedContent = '';
   let roundCount         = 0;
 
   while (roundCount < MAX_TOOL_ROUNDS) {
@@ -67,10 +92,10 @@ async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperat
       response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
-          'Authorization':  `Bearer ${apiKey}`,
-          'Content-Type':   'application/json',
-          'HTTP-Referer':   'https://nerosia.app',
-          'X-Title':        'Nerosia',
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type':  'application/json',
+          'HTTP-Referer':  'https://nerosia.app',
+          'X-Title':       'Nerosia',
         },
         body: JSON.stringify({
           model,
@@ -98,9 +123,9 @@ async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperat
     const decoder = new TextDecoder();
     let   buffer  = '';
 
-    let roundContent  = '';       // texte accumulé ce round
-    let toolCallsAcc  = [];       // tool_calls accumulés
-    let finishReason  = null;
+    let roundContent = '';
+    let toolCallsAcc = [];
+    let finishReason = null;
 
     const flush = async () => {
       const lines = buffer.split('\n');
@@ -118,35 +143,30 @@ async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperat
 
         finishReason = delta.finish_reason ?? finishReason;
 
-        // Token texte
         if (delta.delta?.content) {
           roundContent       += delta.delta.content;
           accumulatedContent += delta.delta.content;
-          // Streamer le texte vers le client en temps réel
           sendSSE(res, { type: 'chunk', content: accumulatedContent });
         }
 
-        // Tool call delta
         if (delta.delta?.tool_calls) {
           for (const tc of delta.delta.tool_calls) {
             const i = tc.index ?? 0;
             if (!toolCallsAcc[i]) toolCallsAcc[i] = { id: '', name: '', arguments: '' };
-            if (tc.id)                     toolCallsAcc[i].id        += tc.id;
-            if (tc.function?.name)         toolCallsAcc[i].name      += tc.function.name;
-            if (tc.function?.arguments)    toolCallsAcc[i].arguments += tc.function.arguments;
+            if (tc.id)                  toolCallsAcc[i].id        += tc.id;
+            if (tc.function?.name)      toolCallsAcc[i].name      += tc.function.name;
+            if (tc.function?.arguments) toolCallsAcc[i].arguments += tc.function.arguments;
           }
         }
       }
     };
 
-    // Lire le stream byte par byte
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       await flush();
     }
-    // Flush final
     buffer += decoder.decode();
     await flush();
 
@@ -160,7 +180,7 @@ async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperat
     if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
     history.push(assistantMsg);
 
-    // ── Pas de tool call → réponse finale, on sort ─────────────────────────
+    // ── Pas de tool call → réponse finale ─────────────────────────────────
     if (toolCalls.length === 0) break;
 
     // ── Exécution des tools ────────────────────────────────────────────────
@@ -170,10 +190,9 @@ async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperat
 
       // ── execute_code ───────────────────────────────────────────────────
       if (tc.function.name === 'execute_code') {
-        const lang = args.language ?? 'python';
+        const lang = args.language    ?? 'python';
         const desc = args.description ?? `Exécution ${lang}`;
 
-        // Notifier le client : step "en cours"
         sendSSE(res, {
           type: 'tool_step',
           step: {
@@ -188,7 +207,6 @@ async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperat
         const result = await executeCode(lang, args.code ?? '');
         const ok     = result.exit_code === 0;
 
-        // Notifier le client : step "terminé"
         sendSSE(res, {
           type: 'tool_step',
           step: {
@@ -202,7 +220,6 @@ async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperat
           },
         });
 
-        // Retourner le résultat au modèle
         history.push({
           role:         'tool',
           tool_call_id: tc.id,
@@ -210,7 +227,6 @@ async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperat
             stdout:    result.stdout,
             stderr:    result.stderr,
             exit_code: result.exit_code,
-            // Hint explicite : si erreur, le modèle est invité à corriger
             hint: ok
               ? 'Exécution réussie.'
               : 'Erreur détectée. Corrige le code et rappelle execute_code.',
@@ -239,11 +255,9 @@ async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperat
         });
       }
     }
-    // → prochain round : le modèle voit les résultats et continue
   }
 
-  // Fin de la boucle
   sendSSE(res, { type: 'done', modelUsed: model });
 }
 
-module.exports = { runAgentLoop };
+module.exports = { runAgentLoop, needsAgentLoop };
