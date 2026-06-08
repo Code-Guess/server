@@ -1,7 +1,6 @@
 // src/tools/definitions.js
 // ─────────────────────────────────────────────────────────────────────────────
 // Déclaration des tools exposés au modèle (format OpenAI function calling)
-// Compatible OpenRouter avec tous les modèles qui supportent tool_calls
 // ─────────────────────────────────────────────────────────────────────────────
 
 const TOOLS = [
@@ -25,7 +24,7 @@ const TOOLS = [
           },
           code: {
             type: 'string',
-            description: 'Code source complet à exécuter. Doit être autonome (pas d\'import externe hors stdlib).',
+            description: 'Code source complet à exécuter. Doit être autonome.',
           },
           description: {
             type: 'string',
@@ -36,6 +35,34 @@ const TOOLS = [
       },
     },
   },
+
+  {
+    type: 'function',
+    function: {
+      name: 'install_package',
+      description: [
+        'Installe un package Python (pip) ou Node.js (npm) dans l\'environnement.',
+        'Appelle cet outil AVANT d\'utiliser une bibliothèque externe.',
+        'Exemple : installe "requests" avant d\'écrire du code qui l\'importe.',
+      ].join(' '),
+      parameters: {
+        type: 'object',
+        properties: {
+          package: {
+            type: 'string',
+            description: 'Nom exact du package à installer (ex: "requests", "numpy", "axios").',
+          },
+          manager: {
+            type: 'string',
+            enum: ['pip', 'npm'],
+            description: 'Gestionnaire de paquets : pip pour Python, npm pour Node.js.',
+          },
+        },
+        required: ['package', 'manager'],
+      },
+    },
+  },
+
   {
     type: 'function',
     function: {
@@ -54,7 +81,7 @@ const TOOLS = [
           },
           old_str: {
             type: 'string',
-            description: 'Texte exact à remplacer. Doit correspondre mot pour mot au contenu actuel.',
+            description: 'Texte exact à remplacer.',
           },
           new_str: {
             type: 'string',
