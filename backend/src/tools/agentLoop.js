@@ -1,23 +1,9 @@
 // src/tools/agentLoop.js
-// ─────────────────────────────────────────────────────────────────────────────
-// Boucle agent multi-phases :
-//   Phase 1 : Analyse + plan + architecture  → thinking "plan"
-//   Phase 2 : Création fichier par fichier   → thinking "create" en streaming
-//             Installation de packages       → thinking "install"
-//             Exécution                      → thinking "terminal" / "error"
-//   Phase 3 : Résumé final                  → thinking "presentation"
-//
-// Flux SSE émis :
-//   { type: 'agent_phase',  phase: 'plan'|'create'|'done', content, files }
-//   { type: 'tool_step',    step: { kind, status, ... } }
-//   { type: 'chunk',        content }   ← résumé final seulement
-//   { type: 'done',         modelUsed }
-// ─────────────────────────────────────────────────────────────────────────────
 
 const { executeCode, installPackage } = require('../sandbox');
 const { TOOLS }                       = require('./definitions');
 const { getSystemPrompt }             = require('../prompts');
-const { openRouterKey }               = require('../openrouter');
+const { getAvailableKeys }            = require('../openrouter'); // ← FIX
 
 const MAX_TOOL_ROUNDS = 10;
 
@@ -66,7 +52,7 @@ function mergeToolCallDeltas(toolCallsAcc) {
 
 // ── Appel LLM avec streaming, retourne { content, toolCalls } ─────────────────
 async function callModel({ res, messages, model, max_tokens, temperature, streamText = false }) {
-  const apiKey = openRouterKey();
+  const apiKey = getAvailableKeys()[0]; // ← FIX
 
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
@@ -118,7 +104,6 @@ async function callModel({ res, messages, model, max_tokens, temperature, stream
 
       if (delta.delta?.content) {
         content += delta.delta.content;
-        // On streame le texte seulement si demandé (phase finale)
         if (streamText) {
           sendSSE(res, { type: 'chunk', content });
         }
@@ -150,7 +135,6 @@ async function callModel({ res, messages, model, max_tokens, temperature, stream
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PHASE 1 : Analyse + Plan
-// On demande au modèle de produire un plan JSON structuré
 // ─────────────────────────────────────────────────────────────────────────────
 const PLAN_SYSTEM = `Tu es un assistant expert en développement logiciel.
 Quand l'utilisateur te demande de créer un projet ou du code, tu réponds UNIQUEMENT avec un JSON structuré (sans markdown) au format :
@@ -170,7 +154,6 @@ Quand l'utilisateur te demande de créer un projet ou du code, tu réponds UNIQU
 Sois précis sur les fichiers à créer et les packages nécessaires.`;
 
 async function runPlanPhase({ res, userMessage, history, model, temperature }) {
-  // Thinking "Analyse en cours"
   sendSSE(res, {
     type: 'agent_phase',
     phase: 'plan',
@@ -183,7 +166,7 @@ async function runPlanPhase({ res, userMessage, history, model, temperature }) {
 
   const planMessages = [
     { role: 'system', content: PLAN_SYSTEM },
-    ...history.slice(-4), // contexte récent
+    ...history.slice(-4),
     { role: 'user', content: userMessage },
   ];
 
@@ -201,7 +184,6 @@ async function runPlanPhase({ res, userMessage, history, model, temperature }) {
     const cleaned = content.replace(/```json|```/g, '').trim();
     plan = JSON.parse(cleaned);
   } catch {
-    // Fallback plan minimal
     plan = {
       summary:      'Génération du code demandé',
       architecture: [],
@@ -210,7 +192,6 @@ async function runPlanPhase({ res, userMessage, history, model, temperature }) {
     };
   }
 
-  // Envoyer le plan complet au client
   sendSSE(res, {
     type: 'agent_phase',
     phase: 'plan',
@@ -234,7 +215,6 @@ async function runPlanPhase({ res, userMessage, history, model, temperature }) {
 async function runCreatePhase({ res, userMessage, history, model, plan, max_tokens, temperature }) {
   const systemPrompt = getSystemPrompt(userMessage, undefined);
 
-  // Prompt de création enrichi avec l'architecture planifiée
   const architectureHint = plan.architecture?.length > 0
     ? `\n\nArchitecture planifiée :\n${plan.architecture.map(f => `- ${f.filename} : ${f.description}`).join('\n')}`
     : '';
@@ -256,11 +236,9 @@ async function runCreatePhase({ res, userMessage, history, model, plan, max_toke
     { role: 'user', content: userMessage },
   ];
 
-  // Map filename → content pour collecter les artefacts
   const createdFiles = new Map();
   let   roundCount   = 0;
 
-  // Thinking "Début de création"
   sendSSE(res, {
     type: 'agent_phase',
     phase: 'create',
@@ -280,20 +258,18 @@ async function runCreatePhase({ res, userMessage, history, model, plan, max_toke
       model,
       max_tokens,
       temperature,
-      streamText: false, // pas de stream texte pendant la création
+      streamText: false,
     });
 
     const assistantMsg = { role: 'assistant', content: content || null };
     if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
     messages.push(assistantMsg);
 
-    // Extraire les fichiers créés depuis le contenu textuel du modèle
     if (content) {
       const fileMatches = [...content.matchAll(/```([^\n`]+)\n([\s\S]*?)```/g)];
       for (const m of fileMatches) {
         const lang = m[1].trim().toLowerCase();
         const code = m[2];
-        // Essayer de trouver le nom de fichier mentionné juste avant
         const filenameMatch = content
           .slice(0, content.indexOf(m[0]))
           .match(/(?:fichier|file|créer?|écrire?)\s+[`"]?([^\s`"']+\.[a-zA-Z0-9]+)[`"]?/i);
@@ -314,15 +290,13 @@ async function runCreatePhase({ res, userMessage, history, model, plan, max_toke
       }
     }
 
-    // Pas de tool call → fin de la création
     if (toolCalls.length === 0) break;
 
-    // Exécuter les tools
     for (const tc of toolCalls) {
       let args = {};
       try { args = JSON.parse(tc.function.arguments); } catch {}
 
-      // ── execute_code ─────────────────────────────────────────────────────
+      // ── execute_code ──────────────────────────────────────────────────────
       if (tc.function.name === 'execute_code') {
         const lang = args.language    ?? 'python';
         const desc = args.description ?? `Exécution ${lang}`;
@@ -338,7 +312,6 @@ async function runCreatePhase({ res, userMessage, history, model, plan, max_toke
           },
         });
 
-        // Extraire le code dans les artefacts si c'est un fichier
         const codeFilename = plan.architecture?.find(f => f.language === lang)?.filename;
         if (codeFilename && args.code) {
           createdFiles.set(codeFilename, { filename: codeFilename, language: lang, content: args.code });
@@ -443,7 +416,6 @@ async function runCreatePhase({ res, userMessage, history, model, plan, max_toke
           },
         });
 
-        // Appliquer le patch dans createdFiles
         const existing = createdFiles.get(args.filename);
         if (existing && args.old_str && args.new_str) {
           existing.content = existing.content.replace(args.old_str, args.new_str);
@@ -477,7 +449,7 @@ async function runSummaryPhase({ res, userMessage, plan, createdFiles, messages,
   });
 
   const summaryMessages = [
-    ...messages.slice(0, 1), // garder le system prompt
+    ...messages.slice(0, 1),
     {
       role: 'user',
       content: `Le projet "${plan.summary}" est terminé. Donne un résumé court et clair (3-5 lignes) de ce qui a été créé, comment l'utiliser, et les points importants. Sois concis et direct.`,
@@ -490,10 +462,9 @@ async function runSummaryPhase({ res, userMessage, plan, createdFiles, messages,
     model:       model === 'opus' ? model : 'sonnet',
     max_tokens:  512,
     temperature,
-    streamText:  true, // on streame le résumé dans le chat
+    streamText:  true,
   });
 
-  // Envoyer les artefacts finaux
   sendSSE(res, {
     type: 'agent_phase',
     phase: 'done',
@@ -519,43 +490,23 @@ async function runSummaryPhase({ res, userMessage, plan, createdFiles, messages,
 // Point d'entrée principal
 // ─────────────────────────────────────────────────────────────────────────────
 async function runAgentLoop({ res, messages, model, max_tokens, temperature }) {
-  // Extraire user message et history depuis messages
-  const systemMsg  = messages.find(m => m.role === 'system');
-  const userMsgs   = messages.filter(m => m.role !== 'system');
-  const lastUser   = [...userMsgs].reverse().find(m => m.role === 'user');
+  const userMsgs    = messages.filter(m => m.role !== 'system');
+  const lastUser    = [...userMsgs].reverse().find(m => m.role === 'user');
   const userMessage = lastUser?.content ?? '';
-  const history    = userMsgs.slice(0, -1); // tout sauf le dernier user
+  const history     = userMsgs.slice(0, -1);
 
   try {
-    // ── Phase 1 : Plan ───────────────────────────────────────────────────────
     const plan = await runPlanPhase({
-      res,
-      userMessage,
-      history,
-      model,
-      temperature,
+      res, userMessage, history, model, temperature,
     });
 
-    // ── Phase 2 : Création ───────────────────────────────────────────────────
     const { createdFiles, finalMessages } = await runCreatePhase({
-      res,
-      userMessage,
-      history,
-      model,
-      plan,
-      max_tokens,
-      temperature,
+      res, userMessage, history, model, plan, max_tokens, temperature,
     });
 
-    // ── Phase 3 : Résumé ─────────────────────────────────────────────────────
     await runSummaryPhase({
-      res,
-      userMessage,
-      plan,
-      createdFiles,
-      messages: finalMessages,
-      model,
-      temperature,
+      res, userMessage, plan, createdFiles,
+      messages: finalMessages, model, temperature,
     });
 
     sendSSE(res, { type: 'done', modelUsed: model });
