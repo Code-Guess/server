@@ -1,16 +1,17 @@
 // src/sandbox.js
 // ─────────────────────────────────────────────────────────────────────────────
 // Sandbox d'exécution sécurisée Python / JavaScript
-// Utilisé par l'agent loop quand le modèle appelle execute_code
+// + Installation de packages (pip / npm)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { exec }        = require('child_process');
-const { writeFileSync, unlinkSync } = require('fs');
-const { randomUUID }  = require('crypto');
-const path            = require('path');
+const { exec }                       = require('child_process');
+const { writeFileSync, unlinkSync }  = require('fs');
+const { randomUUID }                 = require('crypto');
+const path                           = require('path');
 
-const TIMEOUT_MS = 10_000; // 10s max par exécution
-const TMP        = '/tmp';
+const EXEC_TIMEOUT_MS    = 10_000;  // 10s par exécution
+const INSTALL_TIMEOUT_MS = 60_000;  // 60s pour les installs
+const TMP                = '/tmp';
 
 /**
  * Exécute du code Python ou JavaScript dans un sous-process.
@@ -28,22 +29,49 @@ async function executeCode(language, code) {
     : `node "${file}"`;
 
   return new Promise((resolve) => {
-    exec(cmd, { timeout: TIMEOUT_MS }, (err, stdout, stderr) => {
+    exec(cmd, { timeout: EXEC_TIMEOUT_MS }, (err, stdout, stderr) => {
       try { unlinkSync(file); } catch {}
-
       const exitCode = err
-        ? (err.killed ? 124 : (err.code ?? 1)) // 124 = timeout SIGKILL
+        ? (err.killed ? 124 : (err.code ?? 1))
         : 0;
-
       resolve({
         stdout:    (stdout ?? '').trim(),
-        stderr:    (err?.message?.includes('TIMEOUT')
-          ? `Timeout : exécution interrompue après ${TIMEOUT_MS / 1000}s`
-          : (stderr ?? '').trim()),
+        stderr:    (err?.message?.includes('TIMEOUT') || err?.killed)
+          ? `Timeout : exécution interrompue après ${EXEC_TIMEOUT_MS / 1000}s`
+          : (stderr ?? '').trim(),
         exit_code: exitCode,
       });
     });
   });
 }
 
-module.exports = { executeCode };
+/**
+ * Installe un package via pip ou npm.
+ * @param {string} packageName  — nom du package
+ * @param {'pip'|'npm'} manager — gestionnaire de paquets
+ * @returns {{ stdout, stderr, exit_code }}
+ */
+async function installPackage(packageName, manager = 'pip') {
+  // Sanitize : seulement lettres, chiffres, tirets, underscores, @, /
+  const safe = packageName.replace(/[^a-zA-Z0-9\-_.@/]/g, '');
+  if (!safe || safe.length === 0) {
+    return { stdout: '', stderr: 'Nom de package invalide.', exit_code: 1 };
+  }
+
+  const cmd = manager === 'npm'
+    ? `npm install ${safe} --no-save 2>&1`
+    : `pip install ${safe} --quiet 2>&1`;
+
+  return new Promise((resolve) => {
+    exec(cmd, { timeout: INSTALL_TIMEOUT_MS }, (err, stdout, stderr) => {
+      const exitCode = err ? (err.code ?? 1) : 0;
+      resolve({
+        stdout:    (stdout ?? '').trim(),
+        stderr:    (stderr ?? '').trim(),
+        exit_code: exitCode,
+      });
+    });
+  });
+}
+
+module.exports = { executeCode, installPackage };
