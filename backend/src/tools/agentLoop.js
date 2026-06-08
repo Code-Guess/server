@@ -1,24 +1,27 @@
 // src/tools/agentLoop.js
 // ─────────────────────────────────────────────────────────────────────────────
-// Boucle agent : le modèle peut appeler des tools autant de fois que nécessaire
-// avant de rendre sa réponse finale.
+// Boucle agent multi-phases :
+//   Phase 1 : Analyse + plan + architecture  → thinking "plan"
+//   Phase 2 : Création fichier par fichier   → thinking "create" en streaming
+//             Installation de packages       → thinking "install"
+//             Exécution                      → thinking "terminal" / "error"
+//   Phase 3 : Résumé final                  → thinking "presentation"
 //
-// Flux SSE émis vers le client :
-//   { type: 'tool_step', step: { kind, ... } }   ← thinking step visible
-//   { type: 'chunk', content: '...' }             ← token texte final
-//   { type: 'done', modelUsed: '...' }
-//
-// Comportement sur erreur d'exécution :
-//   Le résultat stderr est renvoyé au modèle → il corrige et réessaie
-//   automatiquement (jusqu'à MAX_TOOL_ROUNDS rounds).
+// Flux SSE émis :
+//   { type: 'agent_phase',  phase: 'plan'|'create'|'done', content, files }
+//   { type: 'tool_step',    step: { kind, status, ... } }
+//   { type: 'chunk',        content }   ← résumé final seulement
+//   { type: 'done',         modelUsed }
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { executeCode } = require('../sandbox');
-const { TOOLS }       = require('./definitions');
+const { executeCode, installPackage } = require('../sandbox');
+const { TOOLS }                       = require('./definitions');
+const { getSystemPrompt }             = require('../prompts');
+const { openRouterKey }               = require('../openrouter');
 
-const MAX_TOOL_ROUNDS = 6;
+const MAX_TOOL_ROUNDS = 10;
 
-// ── Patterns qui déclenchent la boucle agent ──────────────────────────────────
+// ── Patterns déclencheurs ─────────────────────────────────────────────────────
 const AGENT_LOOP_PATTERNS = [
   /\bexécute?\b/i,
   /\blance\b/i,
@@ -29,30 +32,25 @@ const AGENT_LOOP_PATTERNS = [
   /\brun\b/i,
   /\bscript\b/i,
   /\bprogramme?\b/i,
-  /\bgenère?\s+(un|le|du)?\s*(fichier|code|script)\b/i,
+  /\bgenère?\s+(un|le|du)?\s*(fichier|code|script|projet|app)\b/i,
+  /\bcrée?\s+(un|le|du)?\s*(fichier|code|script|projet|app)\b/i,
   /\bmodifie?\s+(le|ce|mon)?\s*fichier\b/i,
   /\bedit[_\s]file\b/i,
+  /\binstall\b/i,
+  /\bnpm\b/i,
+  /\bpip\b/i,
 ];
 
-/**
- * Détecte si la requête nécessite la boucle agent (execute_code / edit_file)
- */
 function needsAgentLoop(query) {
   return AGENT_LOOP_PATTERNS.some(re => re.test(query.trim()));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Envoie un event SSE au client
- */
 function sendSSE(res, obj) {
   try { res.write(`data: ${JSON.stringify(obj)}\n\n`); } catch {}
 }
 
-/**
- * Reconstruit les tool_calls depuis les deltas accumulés pendant le stream
- */
 function mergeToolCallDeltas(toolCallsAcc) {
   return toolCallsAcc
     .filter(Boolean)
@@ -66,129 +64,265 @@ function mergeToolCallDeltas(toolCallsAcc) {
     }));
 }
 
-/**
- * runAgentLoop — Point d'entrée principal
- *
- * @param {object} params
- * @param {import('express').Response} params.res         — réponse SSE Express
- * @param {object[]}                  params.messages     — historique OpenAI
- * @param {string}                    params.model        — model string OpenRouter
- * @param {string}                    params.apiKey       — clé OpenRouter
- * @param {number}                    params.max_tokens
- * @param {number}                    params.temperature
- */
-async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperature }) {
-  const history = [...messages];
+// ── Appel LLM avec streaming, retourne { content, toolCalls } ─────────────────
+async function callModel({ res, messages, model, max_tokens, temperature, streamText = false }) {
+  const apiKey = openRouterKey();
 
-  let accumulatedContent = '';
-  let roundCount         = 0;
+  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type':  'application/json',
+      'HTTP-Referer':  'https://nerosia.app',
+      'X-Title':       'Nerosia',
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      tools:       TOOLS,
+      tool_choice: 'auto',
+      stream:      true,
+      max_tokens,
+      temperature,
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`OpenRouter ${response.status}: ${errText}`);
+  }
+
+  const reader  = response.body.getReader();
+  const decoder = new TextDecoder();
+  let   buffer  = '';
+
+  let content      = '';
+  let toolCallsAcc = [];
+  let finishReason = null;
+
+  const flush = () => {
+    const lines = buffer.split('\n');
+    buffer      = lines.pop() ?? '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const raw = trimmed.slice(5).trim();
+      if (!raw || raw === '[DONE]') continue;
+
+      let delta;
+      try { delta = JSON.parse(raw)?.choices?.[0]; } catch { continue; }
+      if (!delta) continue;
+
+      finishReason = delta.finish_reason ?? finishReason;
+
+      if (delta.delta?.content) {
+        content += delta.delta.content;
+        // On streame le texte seulement si demandé (phase finale)
+        if (streamText) {
+          sendSSE(res, { type: 'chunk', content });
+        }
+      }
+
+      if (delta.delta?.tool_calls) {
+        for (const tc of delta.delta.tool_calls) {
+          const i = tc.index ?? 0;
+          if (!toolCallsAcc[i]) toolCallsAcc[i] = { id: '', name: '', arguments: '' };
+          if (tc.id)                  toolCallsAcc[i].id        += tc.id;
+          if (tc.function?.name)      toolCallsAcc[i].name      += tc.function.name;
+          if (tc.function?.arguments) toolCallsAcc[i].arguments += tc.function.arguments;
+        }
+      }
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    flush();
+  }
+  buffer += decoder.decode();
+  flush();
+
+  return { content, toolCalls: mergeToolCallDeltas(toolCallsAcc) };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 1 : Analyse + Plan
+// On demande au modèle de produire un plan JSON structuré
+// ─────────────────────────────────────────────────────────────────────────────
+const PLAN_SYSTEM = `Tu es un assistant expert en développement logiciel.
+Quand l'utilisateur te demande de créer un projet ou du code, tu réponds UNIQUEMENT avec un JSON structuré (sans markdown) au format :
+{
+  "summary": "Description courte du projet",
+  "architecture": [
+    { "filename": "main.py", "description": "Point d'entrée principal", "language": "python" }
+  ],
+  "packages": ["requests", "numpy"],
+  "steps": [
+    "Créer la structure du projet",
+    "Installer les dépendances",
+    "Écrire le code principal",
+    "Tester l'exécution"
+  ]
+}
+Sois précis sur les fichiers à créer et les packages nécessaires.`;
+
+async function runPlanPhase({ res, userMessage, history, model, temperature }) {
+  // Thinking "Analyse en cours"
+  sendSSE(res, {
+    type: 'agent_phase',
+    phase: 'plan',
+    thinking: {
+      label: 'Analyse de votre demande…',
+      icon:  'search',
+      done:  false,
+    },
+  });
+
+  const planMessages = [
+    { role: 'system', content: PLAN_SYSTEM },
+    ...history.slice(-4), // contexte récent
+    { role: 'user', content: userMessage },
+  ];
+
+  const { content } = await callModel({
+    res,
+    messages:    planMessages,
+    model:       model === 'opus' ? model : 'sonnet',
+    max_tokens:  2048,
+    temperature: 0.2,
+    streamText:  false,
+  });
+
+  let plan = null;
+  try {
+    const cleaned = content.replace(/```json|```/g, '').trim();
+    plan = JSON.parse(cleaned);
+  } catch {
+    // Fallback plan minimal
+    plan = {
+      summary:      'Génération du code demandé',
+      architecture: [],
+      packages:     [],
+      steps:        ['Générer le code'],
+    };
+  }
+
+  // Envoyer le plan complet au client
+  sendSSE(res, {
+    type: 'agent_phase',
+    phase: 'plan',
+    plan,
+    thinking: {
+      label: `Plan établi — ${plan.summary}`,
+      icon:  'done',
+      done:  true,
+    },
+    architecture: plan.architecture ?? [],
+    steps:        plan.steps        ?? [],
+    packages:     plan.packages     ?? [],
+  });
+
+  return plan;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 2 : Création (boucle agent avec tools)
+// ─────────────────────────────────────────────────────────────────────────────
+async function runCreatePhase({ res, userMessage, history, model, plan, max_tokens, temperature }) {
+  const systemPrompt = getSystemPrompt(userMessage, undefined);
+
+  // Prompt de création enrichi avec l'architecture planifiée
+  const architectureHint = plan.architecture?.length > 0
+    ? `\n\nArchitecture planifiée :\n${plan.architecture.map(f => `- ${f.filename} : ${f.description}`).join('\n')}`
+    : '';
+  const packagesHint = plan.packages?.length > 0
+    ? `\n\nPackages à installer : ${plan.packages.join(', ')}`
+    : '';
+
+  const createSystemPrompt = systemPrompt +
+    `\n\nTu es en phase de CRÉATION. Utilise les tools disponibles pour :\n` +
+    `1. Installer les packages nécessaires avec install_package\n` +
+    `2. Créer/tester le code avec execute_code\n` +
+    `Si une exécution échoue, analyse l'erreur et corrige automatiquement.\n` +
+    `Chaque fichier créé doit être annoncé clairement.\n` +
+    architectureHint + packagesHint;
+
+  const messages = [
+    { role: 'system', content: createSystemPrompt },
+    ...history.slice(-6),
+    { role: 'user', content: userMessage },
+  ];
+
+  // Map filename → content pour collecter les artefacts
+  const createdFiles = new Map();
+  let   roundCount   = 0;
+
+  // Thinking "Début de création"
+  sendSSE(res, {
+    type: 'agent_phase',
+    phase: 'create',
+    thinking: {
+      label: 'Démarrage de la création…',
+      icon:  'file',
+      done:  false,
+    },
+  });
 
   while (roundCount < MAX_TOOL_ROUNDS) {
     roundCount++;
 
-    // ── Appel au modèle ────────────────────────────────────────────────────
-    let response;
-    try {
-      response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type':  'application/json',
-          'HTTP-Referer':  'https://nerosia.app',
-          'X-Title':       'Nerosia',
-        },
-        body: JSON.stringify({
-          model,
-          messages:    history,
-          tools:       TOOLS,
-          tool_choice: 'auto',
-          stream:      true,
-          max_tokens,
-          temperature,
-        }),
-      });
-    } catch (fetchErr) {
-      sendSSE(res, { type: 'error', message: `Erreur réseau : ${fetchErr.message}` });
-      return;
-    }
+    const { content, toolCalls } = await callModel({
+      res,
+      messages,
+      model,
+      max_tokens,
+      temperature,
+      streamText: false, // pas de stream texte pendant la création
+    });
 
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '');
-      sendSSE(res, { type: 'error', message: `Erreur OpenRouter ${response.status}: ${errText}` });
-      return;
-    }
-
-    // ── Lecture du stream ──────────────────────────────────────────────────
-    const reader  = response.body.getReader();
-    const decoder = new TextDecoder();
-    let   buffer  = '';
-
-    let roundContent = '';
-    let toolCallsAcc = [];
-    let finishReason = null;
-
-    const flush = async () => {
-      const lines = buffer.split('\n');
-      buffer      = lines.pop() ?? '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const raw = trimmed.slice(5).trim();
-        if (!raw || raw === '[DONE]') continue;
-
-        let delta;
-        try { delta = JSON.parse(raw)?.choices?.[0]; } catch { continue; }
-        if (!delta) continue;
-
-        finishReason = delta.finish_reason ?? finishReason;
-
-        if (delta.delta?.content) {
-          roundContent       += delta.delta.content;
-          accumulatedContent += delta.delta.content;
-          sendSSE(res, { type: 'chunk', content: accumulatedContent });
-        }
-
-        if (delta.delta?.tool_calls) {
-          for (const tc of delta.delta.tool_calls) {
-            const i = tc.index ?? 0;
-            if (!toolCallsAcc[i]) toolCallsAcc[i] = { id: '', name: '', arguments: '' };
-            if (tc.id)                  toolCallsAcc[i].id        += tc.id;
-            if (tc.function?.name)      toolCallsAcc[i].name      += tc.function.name;
-            if (tc.function?.arguments) toolCallsAcc[i].arguments += tc.function.arguments;
-          }
-        }
-      }
-    };
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      await flush();
-    }
-    buffer += decoder.decode();
-    await flush();
-
-    const toolCalls = mergeToolCallDeltas(toolCallsAcc);
-
-    // ── Ajouter le message assistant dans l'historique ─────────────────────
-    const assistantMsg = {
-      role:    'assistant',
-      content: roundContent || null,
-    };
+    const assistantMsg = { role: 'assistant', content: content || null };
     if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
-    history.push(assistantMsg);
+    messages.push(assistantMsg);
 
-    // ── Pas de tool call → réponse finale ─────────────────────────────────
+    // Extraire les fichiers créés depuis le contenu textuel du modèle
+    if (content) {
+      const fileMatches = [...content.matchAll(/```([^\n`]+)\n([\s\S]*?)```/g)];
+      for (const m of fileMatches) {
+        const lang = m[1].trim().toLowerCase();
+        const code = m[2];
+        // Essayer de trouver le nom de fichier mentionné juste avant
+        const filenameMatch = content
+          .slice(0, content.indexOf(m[0]))
+          .match(/(?:fichier|file|créer?|écrire?)\s+[`"]?([^\s`"']+\.[a-zA-Z0-9]+)[`"]?/i);
+        const filename = filenameMatch?.[1] ?? plan.architecture?.find(f => f.language === lang)?.filename ?? `code.${lang}`;
+
+        createdFiles.set(filename, { filename, language: lang, content: code });
+
+        sendSSE(res, {
+          type: 'agent_phase',
+          phase: 'file_created',
+          thinking: {
+            label: `Fichier créé : ${filename}`,
+            icon:  'file',
+            done:  true,
+          },
+          file: { filename, language: lang, content: code },
+        });
+      }
+    }
+
+    // Pas de tool call → fin de la création
     if (toolCalls.length === 0) break;
 
-    // ── Exécution des tools ────────────────────────────────────────────────
+    // Exécuter les tools
     for (const tc of toolCalls) {
       let args = {};
       try { args = JSON.parse(tc.function.arguments); } catch {}
 
-      // ── execute_code ───────────────────────────────────────────────────
+      // ── execute_code ─────────────────────────────────────────────────────
       if (tc.function.name === 'execute_code') {
         const lang = args.language    ?? 'python';
         const desc = args.description ?? `Exécution ${lang}`;
@@ -204,8 +338,14 @@ async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperat
           },
         });
 
-        const result = await executeCode(lang, args.code ?? '');
-        const ok     = result.exit_code === 0;
+        // Extraire le code dans les artefacts si c'est un fichier
+        const codeFilename = plan.architecture?.find(f => f.language === lang)?.filename;
+        if (codeFilename && args.code) {
+          createdFiles.set(codeFilename, { filename: codeFilename, language: lang, content: args.code });
+        }
+
+        const execResult = await executeCode(lang, args.code ?? '');
+        const ok         = execResult.exit_code === 0;
 
         sendSSE(res, {
           type: 'tool_step',
@@ -214,26 +354,83 @@ async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperat
             status:    ok ? 'done' : 'error',
             language:  lang,
             label:     desc,
-            stdout:    result.stdout,
-            stderr:    result.stderr,
-            exit_code: result.exit_code,
+            stdout:    execResult.stdout,
+            stderr:    execResult.stderr,
+            exit_code: execResult.exit_code,
           },
         });
 
-        history.push({
+        if (!ok) {
+          sendSSE(res, {
+            type: 'agent_phase',
+            phase: 'retry',
+            thinking: {
+              label: 'Erreur détectée — correction en cours…',
+              icon:  'error',
+              done:  false,
+            },
+          });
+        }
+
+        messages.push({
           role:         'tool',
           tool_call_id: tc.id,
           content:      JSON.stringify({
-            stdout:    result.stdout,
-            stderr:    result.stderr,
-            exit_code: result.exit_code,
+            stdout:    execResult.stdout,
+            stderr:    execResult.stderr,
+            exit_code: execResult.exit_code,
             hint: ok
               ? 'Exécution réussie.'
               : 'Erreur détectée. Corrige le code et rappelle execute_code.',
           }),
         });
 
-      // ── edit_file ──────────────────────────────────────────────────────
+      // ── install_package ───────────────────────────────────────────────────
+      } else if (tc.function.name === 'install_package') {
+        const pkgName = args.package ?? '';
+        const mgr     = args.manager ?? 'pip';
+
+        sendSSE(res, {
+          type: 'tool_step',
+          step: {
+            kind:    'install_package',
+            status:  'running',
+            package: pkgName,
+            manager: mgr,
+            label:   `Installation de ${pkgName} (${mgr})`,
+          },
+        });
+
+        const installResult = await installPackage(pkgName, mgr);
+        const ok            = installResult.exit_code === 0;
+
+        sendSSE(res, {
+          type: 'tool_step',
+          step: {
+            kind:      'install_package',
+            status:    ok ? 'done' : 'error',
+            package:   pkgName,
+            manager:   mgr,
+            label:     `${pkgName} ${ok ? 'installé' : 'échec installation'}`,
+            stdout:    installResult.stdout,
+            stderr:    installResult.stderr,
+            exit_code: installResult.exit_code,
+          },
+        });
+
+        messages.push({
+          role:         'tool',
+          tool_call_id: tc.id,
+          content:      JSON.stringify({
+            status:    ok ? 'installed' : 'error',
+            package:   pkgName,
+            stdout:    installResult.stdout,
+            stderr:    installResult.stderr,
+            exit_code: installResult.exit_code,
+          }),
+        });
+
+      // ── edit_file ─────────────────────────────────────────────────────────
       } else if (tc.function.name === 'edit_file') {
         sendSSE(res, {
           type: 'tool_step',
@@ -241,14 +438,19 @@ async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperat
             kind:        'edit_file',
             status:      'done',
             filename:    args.filename    ?? '',
-            old_str:     args.old_str     ?? '',
-            new_str:     args.new_str     ?? '',
             description: args.description ?? '',
             label:       `Patch : ${args.filename} — ${args.description}`,
           },
         });
 
-        history.push({
+        // Appliquer le patch dans createdFiles
+        const existing = createdFiles.get(args.filename);
+        if (existing && args.old_str && args.new_str) {
+          existing.content = existing.content.replace(args.old_str, args.new_str);
+          createdFiles.set(args.filename, existing);
+        }
+
+        messages.push({
           role:         'tool',
           tool_call_id: tc.id,
           content:      JSON.stringify({ status: 'patch_applied', filename: args.filename }),
@@ -257,7 +459,120 @@ async function runAgentLoop({ res, messages, model, apiKey, max_tokens, temperat
     }
   }
 
-  sendSSE(res, { type: 'done', modelUsed: model });
+  return { createdFiles: [...createdFiles.values()], finalMessages: messages };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 3 : Résumé final + artefacts
+// ─────────────────────────────────────────────────────────────────────────────
+async function runSummaryPhase({ res, userMessage, plan, createdFiles, messages, model, temperature }) {
+  sendSSE(res, {
+    type: 'agent_phase',
+    phase: 'summary',
+    thinking: {
+      label: 'Finalisation et résumé…',
+      icon:  'presentation',
+      done:  false,
+    },
+  });
+
+  const summaryMessages = [
+    ...messages.slice(0, 1), // garder le system prompt
+    {
+      role: 'user',
+      content: `Le projet "${plan.summary}" est terminé. Donne un résumé court et clair (3-5 lignes) de ce qui a été créé, comment l'utiliser, et les points importants. Sois concis et direct.`,
+    },
+  ];
+
+  const { content: summary } = await callModel({
+    res,
+    messages:    summaryMessages,
+    model:       model === 'opus' ? model : 'sonnet',
+    max_tokens:  512,
+    temperature,
+    streamText:  true, // on streame le résumé dans le chat
+  });
+
+  // Envoyer les artefacts finaux
+  sendSSE(res, {
+    type: 'agent_phase',
+    phase: 'done',
+    thinking: {
+      label: `${createdFiles.length} fichier${createdFiles.length > 1 ? 's' : ''} créé${createdFiles.length > 1 ? 's' : ''} avec succès`,
+      icon:  'presentation',
+      done:  true,
+    },
+    files: createdFiles.map((f, i) => ({
+      id:       `af_${i}_${f.filename}`,
+      filename: f.filename,
+      language: f.language,
+      content:  f.content,
+      done:     true,
+    })),
+    summary,
+  });
+
+  return summary;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Point d'entrée principal
+// ─────────────────────────────────────────────────────────────────────────────
+async function runAgentLoop({ res, messages, model, max_tokens, temperature }) {
+  // Extraire user message et history depuis messages
+  const systemMsg  = messages.find(m => m.role === 'system');
+  const userMsgs   = messages.filter(m => m.role !== 'system');
+  const lastUser   = [...userMsgs].reverse().find(m => m.role === 'user');
+  const userMessage = lastUser?.content ?? '';
+  const history    = userMsgs.slice(0, -1); // tout sauf le dernier user
+
+  try {
+    // ── Phase 1 : Plan ───────────────────────────────────────────────────────
+    const plan = await runPlanPhase({
+      res,
+      userMessage,
+      history,
+      model,
+      temperature,
+    });
+
+    // ── Phase 2 : Création ───────────────────────────────────────────────────
+    const { createdFiles, finalMessages } = await runCreatePhase({
+      res,
+      userMessage,
+      history,
+      model,
+      plan,
+      max_tokens,
+      temperature,
+    });
+
+    // ── Phase 3 : Résumé ─────────────────────────────────────────────────────
+    await runSummaryPhase({
+      res,
+      userMessage,
+      plan,
+      createdFiles,
+      messages: finalMessages,
+      model,
+      temperature,
+    });
+
+    sendSSE(res, { type: 'done', modelUsed: model });
+
+  } catch (err) {
+    console.error('[agentLoop] Erreur :', err.message);
+    sendSSE(res, {
+      type: 'agent_phase',
+      phase: 'error',
+      thinking: {
+        label: `Erreur : ${err.message.slice(0, 80)}`,
+        icon:  'error',
+        done:  true,
+      },
+    });
+    sendSSE(res, { type: 'error', message: err.message });
+  }
 }
 
 module.exports = { runAgentLoop, needsAgentLoop };
