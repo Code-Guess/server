@@ -57,23 +57,40 @@ Expressions reconnues :
 Si le type n'est pas dans cette liste → écrire uniquement :
 "⚠️ Type non reconnu dans ce cours."
 
-══════════════════════════════════════════════════
+══════════════════════════════════════════════════════════════════════
 II-1° — SIGNE DU BINÔME ax + b
-══════════════════════════════════════════════════
+(Cours — Adama Traoré, Lycée Technique)
+══════════════════════════════════════════════════════════════════════
 
-Soit le binôme f(x) = ax + b.
-- Si a = 0, alors f(x) est du signe de b.
-- Si a ≠ 0, alors f(x) = 0 ⟺ ax + b = 0 ⟺ x = −b/a.
+Soit le binôme \\(f(x) = ax + b\\).
 
-──────────────────────────────────────────────────
-EXEMPLE COMPLET — étudier le signe de f(x) = −2x + 12
-──────────────────────────────────────────────────
+- Si \\(a = 0\\), alors \\(f(x)\\) est du signe de \\(b\\).
+- Si \\(a \\neq 0\\), alors \\(f(x) = 0 \\iff ax + b = 0 \\iff x = -\\dfrac{b}{a}\\).
+
+Règle du signe :
+
+\`\`\`sign-table
+{
+  "headers": ["-∞", "-b/a", "+∞"],
+  "rows": [
+    { "label": "ax+b", "values": ["Signe de (-a)", "0", "Signe de a"] }
+  ]
+}
+\`\`\`
+
+Autrement dit : à gauche de \\(-\\frac{b}{a}\\) le binôme est du signe de \\(-a\\),
+à droite il est du signe de \\(a\\).
+
+──────────────────────────────────────────────────────────────────────
+EXEMPLE COMPLET — étudier le signe de \\(f(x) = -2x + 12\\)
+──────────────────────────────────────────────────────────────────────
 
 🔍 Type détecté : binôme du premier degré
 📌 Méthode : II-1° BINÔME
 
-−2x + 12 = 0
-⟹ x = 6.
+\\[-2x + 12 = 0\\]
+
+\\[x = 6\\]
 
 \`\`\`sign-table
 {
@@ -84,8 +101,9 @@ EXEMPLE COMPLET — étudier le signe de f(x) = −2x + 12
 }
 \`\`\`
 
-Pour x ∈ ]−∞ ; 6] : f(x) ≥ 0
-Pour x ∈ [6 ; +∞[ : f(x) ≤ 0
+Pour \\(x \\in ]-\\infty\\,;\\,6]\\) : \\(f(x) \\geq 0\\)
+
+Pour \\(x \\in [6\\,;\\,+\\infty[\\) : \\(f(x) \\leq 0\\)
 `;
 
 module.exports = { MATH_BINOME_PROMPT };
