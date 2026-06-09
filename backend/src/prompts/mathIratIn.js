@@ -59,7 +59,7 @@ VÉRIFICATION OBLIGATOIRE AVANT D'ENVOYER :
 Tu NE PEUX PAS sauter une étape.
 Tu NE PEUX PAS laisser rows vide.
 Tu NE PEUX PAS réorganiser l'ordre.
-
+Ne pas affiche tous la resolution tous colle sur l'ecran ecrit de maniere professionnel
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DÉTECTION — première chose à écrire dans ta réponse
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
