@@ -22,6 +22,14 @@ const { DISSERTATION_PROMPT }          = require('./dissertation');
 const { DESIGN_PROMPT }                = require('./design');
 const { PROGRAMMATION_PROMPT }         = require('./programmation');
 
+// ── Arithmétique — 6 modules spécialisés ─────────────────────────────────────
+const { ARITH_DIVISION_NUMERATION_PROMPT }          = require('./arith_division_numerations');
+const { ARITH_MULTIPLES_DIVISEURS_PREMIERS_PROMPT } = require('./arith_multiples_diviseurs_premiers');
+const { ARITH_CONGRUENCE_PROMPT }                   = require('./arith_congruence');
+const { ARITH_EQUATIONS_ZNZ_PROMPT }                = require('./arith_equations_znz');
+const { ARITH_PGCD_PPCM_PROMPT }                    = require('./arith_pgcd_ppcm');
+const { ARITH_DIOPHANTIENNE_PROMPT }                = require('./arith_diophantienne');
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function normalize(str) {
@@ -56,6 +64,81 @@ function hasTrigInequality(msg, msgN) {
   const hasTrigTerm = ['arccos','arcsin','arctan','2kπ','2k\\pi'].some(k => msg.includes(k)) || msgN.includes('trig');
   const hasIneq = hasSigneIneg(msg) || hasInequation(msgN);
   return (hasTrigFunc && hasIneq) || (hasTrigTerm && hasIneq);
+}
+
+// ── Détecteurs arithmétique ───────────────────────────────────────────────────
+
+function hasArithDivisionNumeration(msgN) {
+  const keywords = [
+    'division euclidienne dans n', 'division euclidienne dans z',
+    'trouver q et r', 'a = bq + r', 'quotient et reste',
+    'base 2', 'base 3', 'base 8', 'base 16', 'base deux', 'base seize', 'base treize', 'base huit',
+    'systeme binaire', 'systeme hexadecimal', 'systeme de numeration',
+    'ecrire en base', 'convertir en base', 'developpement en base',
+    'addition en base', 'multiplication en base', 'operation en base',
+    'raisonnement par recurrence', 'principe de recurrence',
+    'demontrer par recurrence', 'montrer par recurrence',
+  ];
+  return keywords.some(kw => msgN.includes(normalize(kw)));
+}
+
+function hasArithMultiplesDiviseursPremiers(msgN) {
+  const keywords = [
+    'multiple de', 'ensemble des multiples', 'az =', 'nz =',
+    'diviseur de', 'ensemble des diviseurs', 'div(', 'd30', 'd12', 'd60',
+    'nombre premier', 'nombres premiers', 'est-il premier', 'tester si premier',
+    'crible d eratosthene', 'eratosthene',
+  ];
+  return keywords.some(kw => msgN.includes(normalize(kw)));
+}
+
+function hasArithCongruence(msgN, msg) {
+  const keywords = [
+    'congruence', 'congruent', 'congru',
+    'z/nz', 'z/3z', 'z/4z', 'z/5z', 'z/6z', 'z/7z', 'z/9z', 'z/11z', 'z/12z', 'z/13z',
+    'anneau integre', 'anneau commutatif', 'diviseur de zero',
+    'classe modulo', 'classes d equivalence', 'ensemble quotient',
+    'critere de divisibilite', 'divisible par 2', 'divisible par 3',
+    'divisible par 4', 'divisible par 11',
+    'periodicite des restes', 'restes successifs',
+  ];
+  const hasModulo = /\[\s*\d+\s*\]/.test(msg);   // ex: [7], [9], [11]
+  return keywords.some(kw => msgN.includes(normalize(kw))) || hasModulo;
+}
+
+function hasArithEquationsZnZ(msgN) {
+  const keywords = [
+    'equation dans z/', 'resoudre dans z/', 'resoudre dans z/nz',
+    'resoudre dans z/5z', 'resoudre dans z/6z', 'resoudre dans z/7z',
+    'resoudre dans z/13z',
+    'equation du second degre dans z/', 'systeme dans z/',
+    'systeme d equations dans z/', 'inverse dans z/', 'element inversible',
+  ];
+  return keywords.some(kw => msgN.includes(normalize(kw)));
+}
+
+function hasArithPgcdPpcm(msgN) {
+  const keywords = [
+    'pgcd', 'ppcm', 'plus grand commun diviseur', 'plus petit commun multiple',
+    'algorithme d euclide', 'algorithme de euclide',
+    'nombres etrangers', 'premiers entre eux',
+    'bezout', 'theoreme de bezout', 'identite de bezout',
+    'theoreme de gauss', 'decomposition en facteurs premiers',
+    'decomposer en produit de facteurs', 'formule du binome', 'binome de newton',
+    'trouver les couples', 'tous les couples tels que pgcd',
+    'relation pgcd ppcm',
+  ];
+  return keywords.some(kw => msgN.includes(normalize(kw)));
+}
+
+function hasArithDiophantienne(msgN) {
+  const keywords = [
+    'equation diophantienne', 'ax + by', 'ax + by =',
+    'resoudre dans z x z', 'resoudre dans z²', 'solutions entieres',
+    'solutions dans z', 'couple solution entier',
+    'equation lineaire diophantienne', 'equation du 1er degre dans z',
+  ];
+  return keywords.some(kw => msgN.includes(normalize(kw)));
 }
 
 // ── Table des règles par mots-clés ───────────────────────────────────────────
@@ -141,7 +224,30 @@ function getSystemPrompt(userMessage, webContext) {
     matched = true;
   }
 
-  // ── Routage par mots-clés (si aucun signal combiné n'a matché) ───────────
+  // ── Routage arithmétique — 6 modules (ordre du plus spécifique au plus général) ──
+  if (!matched) {
+    if (hasArithDiophantienne(msgN)) {
+      systemPrompt += `\n\n---\n\n${ARITH_DIOPHANTIENNE_PROMPT}`;
+      matched = true;
+    } else if (hasArithEquationsZnZ(msgN)) {
+      systemPrompt += `\n\n---\n\n${ARITH_EQUATIONS_ZNZ_PROMPT}`;
+      matched = true;
+    } else if (hasArithCongruence(msgN, msg)) {
+      systemPrompt += `\n\n---\n\n${ARITH_CONGRUENCE_PROMPT}`;
+      matched = true;
+    } else if (hasArithPgcdPpcm(msgN)) {
+      systemPrompt += `\n\n---\n\n${ARITH_PGCD_PPCM_PROMPT}`;
+      matched = true;
+    } else if (hasArithMultiplesDiviseursPremiers(msgN)) {
+      systemPrompt += `\n\n---\n\n${ARITH_MULTIPLES_DIVISEURS_PREMIERS_PROMPT}`;
+      matched = true;
+    } else if (hasArithDivisionNumeration(msgN)) {
+      systemPrompt += `\n\n---\n\n${ARITH_DIVISION_NUMERATION_PROMPT}`;
+      matched = true;
+    }
+  }
+
+  // ── Routage par mots-clés (si aucun signal prioritaire n'a matché) ────────
   if (!matched) {
     for (const rule of PROMPT_RULES) {
       if (rule.keywords.some(kw => msgN.includes(normalize(kw)))) {
