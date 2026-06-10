@@ -1,5 +1,12 @@
 // src/routes/chat.js
 // ─────────────────────────────────────────────────────────────────────────────
+// PATCH : support des pièces jointes (images + PDF)
+//   1. buildUserContent() — construit un content[] Anthropic avec les blocs
+//      image/document AVANT le texte
+//   2. Les messages précédents (history) conservent leur format string normal
+//   3. Le message courant seul devient un array si des attachments sont présents
+//   4. Validation des mimeTypes acceptés par Anthropic
+// ─────────────────────────────────────────────────────────────────────────────
 
 const express = require('express');
 const router  = express.Router();
@@ -8,6 +15,105 @@ const { getSystemPrompt }                    = require('../prompts');
 const { runSearchAgent }                     = require('../agents/searchAgents');
 const { runCodePipeline, needsCodePipeline } = require('../agents/codeAgents');
 const { runAgentLoop, needsAgentLoop }       = require('../tools/agentLoop');
+
+// ── Types MIME acceptés par l'API Anthropic ───────────────────────────────────
+const ACCEPTED_IMAGE_TYPES = new Set([
+  'image/jpeg',
+  'image/jpg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+]);
+
+const ACCEPTED_DOC_TYPES = new Set([
+  'application/pdf',
+]);
+
+// ── Construction du contenu user avec pièces jointes ─────────────────────────
+// Retourne une string simple si pas de pièces jointes,
+// ou un array de blocs Anthropic si des attachments sont présents.
+// Les blocs image/document viennent AVANT le texte (meilleure compréhension).
+function buildUserContent(message, attachments = []) {
+  if (!attachments || attachments.length === 0) {
+    return message;
+  }
+
+  const blocks = [];
+
+  for (const att of attachments) {
+    if (!att.base64 || !att.mimeType) {
+      console.warn('[chat] Attachment ignoré — base64 ou mimeType manquant :', att.name);
+      continue;
+    }
+
+    if (att.type === 'image') {
+      // Normaliser jpeg → image/jpeg
+      let mimeType = att.mimeType.toLowerCase();
+      if (mimeType === 'image/jpg') mimeType = 'image/jpeg';
+
+      if (!ACCEPTED_IMAGE_TYPES.has(mimeType)) {
+        console.warn('[chat] Image ignorée — mimeType non supporté :', mimeType);
+        continue;
+      }
+
+      blocks.push({
+        type: 'image',
+        source: {
+          type:       'base64',
+          media_type: mimeType,
+          data:       att.base64,
+        },
+      });
+
+    } else if (att.type === 'document') {
+      let mimeType = att.mimeType.toLowerCase();
+
+      // Corriger les mimeTypes génériques envoyés par DocumentPicker
+      if (
+        mimeType === 'application/octet-stream' ||
+        mimeType === 'application/x-unknown' ||
+        mimeType === ''
+      ) {
+        // Détecter PDF depuis le nom du fichier
+        if (att.name && att.name.toLowerCase().endsWith('.pdf')) {
+          mimeType = 'application/pdf';
+        } else {
+          console.warn('[chat] Document ignoré — mimeType non déterminable :', att.name);
+          continue;
+        }
+      }
+
+      if (!ACCEPTED_DOC_TYPES.has(mimeType)) {
+        console.warn('[chat] Document ignoré — mimeType non supporté :', mimeType);
+        continue;
+      }
+
+      blocks.push({
+        type: 'document',
+        source: {
+          type:       'base64',
+          media_type: mimeType,
+          data:       att.base64,
+        },
+      });
+    }
+  }
+
+  // Si aucun bloc valide n'a été construit, renvoyer le message simple
+  if (blocks.length === 0) {
+    return message;
+  }
+
+  // Ajouter le texte en dernier
+  if (message && message.trim().length > 0) {
+    blocks.push({
+      type: 'text',
+      text: message,
+    });
+  }
+
+  return blocks;
+}
 
 // ── Requêtes qui ne nécessitent PAS de recherche web ─────────────────────────
 const NO_SEARCH_PATTERNS = [
@@ -76,10 +182,18 @@ router.post('/', async (req, res) => {
     deepResearch = false,
     max_tokens,
     temperature,
+    attachments  = [],   // FIX : récupéré depuis req.body
   } = req.body;
 
   if (!message || typeof message !== 'string') {
     return res.status(400).json({ error: 'message requis' });
+  }
+
+  // Log debug pour vérifier la réception
+  if (attachments.length > 0) {
+    console.log(`[chat] ${attachments.length} pièce(s) jointe(s) reçue(s) :`,
+      attachments.map(a => `${a.name} (${a.type}, ${a.mimeType}, base64: ${a.base64 ? Math.round(a.base64.length / 1024) + ' Ko' : 'absent'})`).join(', ')
+    );
   }
 
   res.setHeader('Content-Type',      'text/event-stream');
@@ -118,10 +232,13 @@ router.post('/', async (req, res) => {
         }))
         .filter(m => m.content.trim().length > 0);
 
+      // FIX : construire le contenu user avec les pièces jointes
+      const userContent = buildUserContent(message, attachments);
+
       const messages = [
         { role: 'system', content: systemPrompt },
         ...previousMessages,
-        { role: 'user', content: message },
+        { role: 'user', content: userContent },
       ];
 
       await runAgentLoop({
@@ -181,10 +298,14 @@ router.post('/', async (req, res) => {
       }))
       .filter(m => m.content.trim().length > 0);
 
+    // FIX : le message user courant est buildé avec ses pièces jointes
+    // Les messages précédents restent en string (historique sans médias)
+    const userContent = buildUserContent(message, attachments);
+
     const messages = [
       { role: 'system', content: systemPrompt },
       ...previousMessages,
-      { role: 'user', content: message },
+      { role: 'user', content: userContent },
     ];
 
     // ── 5. Appel LLM en streaming ─────────────────────────────────────────────
