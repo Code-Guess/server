@@ -11,7 +11,7 @@ const KEYS = [
 
 /** Modèles disponibles par niveau (tier). */
 const OPENROUTER_MODELS = {
-  opus:   'openrouter/owl-alpha',
+  opus:   'openrouter/gpt-oss-120b:free',
   sonnet: 'openrouter/owl-alpha',
   haiku:  'openai/gpt-oss-20b:free',
 };
