@@ -13,7 +13,7 @@ const KEYS = [
 const OPENROUTER_MODELS = {
   opus:   'openrouter/owl-alpha',
   sonnet: 'openrouter/owl-alpha',
-  haiku:  'openai/gpt-oss-20b:free',
+  haiku:  'openai/gpt-oss-120b:free',
 };
 
 /** Limite de tokens par tier. */
