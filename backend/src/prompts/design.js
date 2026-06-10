@@ -93,7 +93,7 @@ Avant de livrer, retire un élément décoratif. Si le design tient sans lui, il
 - Respecte les rôles : background, surface, text, accent, border
 
 ### 2. Typographie — respecter le RAG
-- Inclure le `<link>` Google Fonts dans le `<head>`
+- Inclure la balise 'link' Google Fonts dans le 'head'
 - Utiliser les font-family exactes du RAG
 - Respecter les tailles, poids et letter-spacing définis
 
@@ -108,7 +108,7 @@ Avant de livrer, retire un élément décoratif. Si le design tient sans lui, il
 \`\`\`
 
 ### 5. Images — URLs cohérentes
-- Format Unsplash : \`https://images.unsplash.com/photo-[ID]?auto=format&fit=crop&q=80&w=800\`
+- Format Unsplash : 'https://images.unsplash.com/photo-[ID]?auto=format&fit=crop&q=80&w=800'
 - Ou placeholder Supabase du RAG si disponible
 
 ### 6. JavaScript — minimal et fonctionnel
@@ -132,7 +132,7 @@ Avant de livrer, retire un élément décoratif. Si le design tient sans lui, il
 
 Génère UN fichier HTML complet et autonome :
 
-\`\`\`
+\`\`\`html
 <!DOCTYPE html>
 <html lang="[fr/en]">
 <head>
