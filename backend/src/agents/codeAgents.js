@@ -1,3 +1,5 @@
+'use strict';
+
 // ─────────────────────────────────────────────────────────────────────────────
 // src/agents/codeAgents.js — Pipeline multi-agents génération de code
 // ─────────────────────────────────────────────────────────────────────────────
@@ -265,6 +267,11 @@ function needsCodePipeline(query) {
 }
 
 // ── Orchestrateur ─────────────────────────────────────────────────────────────
+// FIX : le builder était en batch parallèle (Promise.all) sans aucun SSE
+// intermédiaire. 3 fichiers × 8000 tokens = 30-60s de silence total côté client.
+// Correction : on passe en séquentiel fichier par fichier, avec un appel
+// onStepUpdate après CHAQUE fichier construit. L'utilisateur voit la progression
+// en temps réel au lieu d'un long écran blanc.
 
 async function runCodePipeline(userRequest, onStepUpdate) {
   const steps = [
@@ -318,22 +325,37 @@ async function runCodePipeline(userRequest, onStepUpdate) {
       return { steps, projectName: spec.project_name ?? '', projectDescription: spec.description ?? '', enhancedPrompt: enhancedRequest, files: [], folders: [], entryPoint: spec.entry_point ?? '', summary: "Impossible de planifier l'architecture.", error: String(e) };
     }
 
-    // STEP 3 : Builder
+    // STEP 3 : Builder — séquentiel avec SSE par fichier
+    // FIX : avant, c'était Promise.all(batch) = silence total pendant 30-60s.
+    // Maintenant : chaque fichier est construit l'un après l'autre, et
+    // onStepUpdate est appelé dès qu'un fichier est prêt → progression visible.
     update(3, 'running');
     const filesToBuild = (arch.files ?? []).slice(0, 20);
     const builtFiles = [];
     try {
       const orderedNames = arch.implementation_order ?? filesToBuild.map(f => f.name);
-      const orderedFiles = orderedNames.map(name => filesToBuild.find(f => f.name === name)).filter(Boolean);
-      filesToBuild.forEach(f => { if (!orderedFiles.find(o => o.name === f.name)) orderedFiles.push(f); });
+      const orderedFiles = orderedNames
+        .map(name => filesToBuild.find(f => f.name === name))
+        .filter(Boolean);
+      // Ajoute les fichiers non inclus dans l'ordre (s'il y en a)
+      filesToBuild.forEach(f => {
+        if (!orderedFiles.find(o => o.name === f.name)) orderedFiles.push(f);
+      });
 
-      const BATCH_SIZE = 3;
-      for (let i = 0; i < orderedFiles.length; i += BATCH_SIZE) {
-        const batch = orderedFiles.slice(i, i + BATCH_SIZE);
-        update(3, 'running', `⚙️ Génération : ${batch.map(f => f.name.split('/').pop()).join(', ')}…`);
-        const batchResults = await Promise.all(batch.map(fileSpec => buildSingleFile(fileSpec, { spec: specJson, architecture: archJson, ragContent })));
-        builtFiles.push(...batchResults);
+      for (let i = 0; i < orderedFiles.length; i++) {
+        const fileSpec = orderedFiles[i];
+        const shortName = fileSpec.name.split('/').pop();
+        update(3, 'running', `⚙️ ${shortName} (${i + 1}/${orderedFiles.length})…`);
+
+        const built = await buildSingleFile(fileSpec, {
+          spec: specJson, architecture: archJson, ragContent,
+        });
+        builtFiles.push(built);
+
+        // SSE intermédiaire après chaque fichier construit
+        update(3, 'running', `✅ ${shortName} — ${i + 1}/${orderedFiles.length} fichiers`);
       }
+
       update(3, 'done', `⚙️ ${builtFiles.length} fichier(s) généré(s)`);
     } catch (e) {
       update(3, 'error', '⚙️ Erreur génération');
