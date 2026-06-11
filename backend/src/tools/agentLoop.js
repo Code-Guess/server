@@ -143,6 +143,9 @@ async function callModel({ res, messages, tier, max_tokens, temperature, streamT
 }
 
 // ─── Phase 1 : Analyse + Plan ─────────────────────────────────────────────────
+// FIX : heartbeat SSE toutes les 3 secondes pendant l'attente LLM.
+// Sans ça, l'utilisateur voit le spinner "Réflexion en cours…" figé pendant
+// 10-20s sans aucun retour — le client croit que le serveur est mort.
 
 const PLAN_SYSTEM = `Tu es un assistant expert en développement logiciel.
 Quand l'utilisateur te demande de créer un projet ou du code, tu réponds UNIQUEMENT avec un JSON structuré (sans markdown) :
@@ -165,16 +168,38 @@ async function runPlanPhase({ res, userMessage, history, tier, temperature }) {
     thinking: { label: 'Analyse de votre demande…', icon: 'search', done: false },
   });
 
-  const { content } = await callModel({
-    res,
-    messages: [
-      { role: 'system', content: PLAN_SYSTEM },
-      ...history.slice(-4),
-      { role: 'user', content: userMessage },
-    ],
-    tier: tier === 'opus' ? 'opus' : 'sonnet',
-    max_tokens: 2048, temperature: 0.2, streamText: false,
-  });
+  // FIX : heartbeat toutes les 3s pour montrer que le serveur travaille.
+  // Sans ça, 15-20s de silence côté client → l'utilisateur pense à un freeze.
+  const heartbeatLabels = [
+    'Analyse de votre demande…',
+    'Lecture du contexte…',
+    'Planification des fichiers…',
+    'Préparation de l\'architecture…',
+  ];
+  let heartbeatIdx = 0;
+  const heartbeat = setInterval(() => {
+    heartbeatIdx = (heartbeatIdx + 1) % heartbeatLabels.length;
+    sendSSE(res, {
+      type: 'agent_phase', phase: 'plan',
+      thinking: { label: heartbeatLabels[heartbeatIdx], icon: 'search', done: false },
+    });
+  }, 3_000);
+
+  let content;
+  try {
+    ({ content } = await callModel({
+      res,
+      messages: [
+        { role: 'system', content: PLAN_SYSTEM },
+        ...history.slice(-4),
+        { role: 'user', content: userMessage },
+      ],
+      tier: tier === 'opus' ? 'opus' : 'sonnet',
+      max_tokens: 2048, temperature: 0.2, streamText: false,
+    }));
+  } finally {
+    clearInterval(heartbeat);
+  }
 
   let plan;
   try {
@@ -195,6 +220,9 @@ async function runPlanPhase({ res, userMessage, history, tier, temperature }) {
 }
 
 // ─── Phase 2 : Création (boucle agent avec tools) ─────────────────────────────
+// FIX : streamText passe à true pour que le client voie le code arriver
+// token par token pendant la génération. Avant : callModel bloquait tout
+// le temps de génération (pouvait durer 20-40s) sans rien envoyer au client.
 
 async function runCreatePhase({ res, userMessage, history, tier, plan, max_tokens, temperature }) {
   const systemPrompt = getSystemPrompt(userMessage, undefined);
@@ -232,8 +260,11 @@ async function runCreatePhase({ res, userMessage, history, tier, plan, max_token
   while (roundCount < MAX_TOOL_ROUNDS) {
     roundCount++;
 
+    // FIX : streamText: true — le contenu textuel (explication du modèle,
+    // blocs de code markdown) est streamé en temps réel via SSE type:'chunk'.
+    // Avant : streamText: false bloquait tout jusqu'à la fin du round LLM.
     const { content, toolCalls } = await callModel({
-      res, messages, tier, max_tokens, temperature, streamText: false,
+      res, messages, tier, max_tokens, temperature, streamText: true,
     });
 
     const assistantMsg = { role: 'assistant', content: content || null };
@@ -246,7 +277,6 @@ async function runCreatePhase({ res, userMessage, history, tier, plan, max_token
         const lang = m[1].trim().toLowerCase();
         const code = m[2];
 
-        // Cherche le vrai nom de fichier dans le texte précédant le bloc
         const precedingText = content.slice(0, content.indexOf(m[0]));
         const nameMatch = precedingText.match(
           /(?:fichier|file|créer?|écrire?|voici|`)\s*[`"]?([^\s`"']+\.[a-zA-Z0-9]+)[`"]?\s*(?::|–|-)?/i
@@ -288,7 +318,6 @@ async function runCreatePhase({ res, userMessage, history, tier, plan, max_token
           step: { kind: 'execute_code', status: 'running', language: lang, label: desc, code: args.code ?? '' },
         });
 
-        // Vrai nom depuis l'architecture, sinon nom par défaut de la langue
         const codeFilename =
           plan.architecture?.find(f =>
             f.language === lang || f.filename.toLowerCase().endsWith(`.${lang}`)
