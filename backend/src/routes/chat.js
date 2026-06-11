@@ -1,11 +1,7 @@
 // src/routes/chat.js
 // ─────────────────────────────────────────────────────────────────────────────
-// PATCH : support des pièces jointes (images + PDF)
-//   1. buildUserContent() — construit un content[] Anthropic avec les blocs
-//      image/document AVANT le texte
-//   2. Les messages précédents (history) conservent leur format string normal
-//   3. Le message courant seul devient un array si des attachments sont présents
-//   4. Validation des mimeTypes acceptés par Anthropic
+// Support des pièces jointes (images + PDF) avec détection multimodale
+// La conversion Anthropic → OpenAI est gérée dans openrouter.js
 // ─────────────────────────────────────────────────────────────────────────────
 
 const express = require('express');
@@ -32,7 +28,7 @@ const ACCEPTED_DOC_TYPES = new Set([
 // ── Construction du contenu user avec pièces jointes ─────────────────────────
 // Retourne une string simple si pas de pièces jointes,
 // ou un array de blocs Anthropic si des attachments sont présents.
-// Les blocs image/document viennent AVANT le texte (meilleure compréhension).
+// openrouter.js se charge ensuite de convertir au format OpenAI si nécessaire.
 function buildUserContent(message, attachments = []) {
   if (!attachments || attachments.length === 0) {
     return message;
@@ -47,7 +43,6 @@ function buildUserContent(message, attachments = []) {
     }
 
     if (att.type === 'image') {
-      // Normaliser jpeg → image/jpeg
       let mimeType = att.mimeType.toLowerCase();
       if (mimeType === 'image/jpg') mimeType = 'image/jpeg';
 
@@ -68,13 +63,11 @@ function buildUserContent(message, attachments = []) {
     } else if (att.type === 'document') {
       let mimeType = att.mimeType.toLowerCase();
 
-      // Corriger les mimeTypes génériques envoyés par DocumentPicker
       if (
         mimeType === 'application/octet-stream' ||
         mimeType === 'application/x-unknown' ||
         mimeType === ''
       ) {
-        // Détecter PDF depuis le nom du fichier
         if (att.name && att.name.toLowerCase().endsWith('.pdf')) {
           mimeType = 'application/pdf';
         } else {
@@ -99,12 +92,10 @@ function buildUserContent(message, attachments = []) {
     }
   }
 
-  // Si aucun bloc valide n'a été construit, renvoyer le message simple
   if (blocks.length === 0) {
     return message;
   }
 
-  // Ajouter le texte en dernier
   if (message && message.trim().length > 0) {
     blocks.push({
       type: 'text',
@@ -182,17 +173,21 @@ router.post('/', async (req, res) => {
     deepResearch = false,
     max_tokens,
     temperature,
-    attachments  = [],   // FIX : récupéré depuis req.body
+    attachments  = [],
   } = req.body;
 
   if (!message || typeof message !== 'string') {
     return res.status(400).json({ error: 'message requis' });
   }
 
-  // Log debug pour vérifier la réception
   if (attachments.length > 0) {
     console.log(`[chat] ${attachments.length} pièce(s) jointe(s) reçue(s) :`,
-      attachments.map(a => `${a.name} (${a.type}, ${a.mimeType}, base64: ${a.base64 ? Math.round(a.base64.length / 1024) + ' Ko' : 'absent'})`).join(', ')
+      attachments.map(a =>
+        `${a.name} (${a.type}, ${a.mimeType}, base64: ${a.base64
+          ? Math.round(a.base64.length / 1024) + ' Ko'
+          : 'ABSENT ← problème'
+        })`
+      ).join(', ')
     );
   }
 
@@ -232,7 +227,6 @@ router.post('/', async (req, res) => {
         }))
         .filter(m => m.content.trim().length > 0);
 
-      // FIX : construire le contenu user avec les pièces jointes
       const userContent = buildUserContent(message, attachments);
 
       const messages = [
@@ -255,7 +249,11 @@ router.post('/', async (req, res) => {
     let systemContext = '';
     let sources       = [];
 
-    if (needsSearch(message)) {
+    // On ne recherche pas si le message est court ou vide (l'utilisateur
+    // a peut-être seulement envoyé une image sans texte)
+    const shouldSearch = message.trim().length >= 8 && needsSearch(message);
+
+    if (shouldSearch) {
       send({ type: 'searching', status: 'loading', label: 'Recherche en cours…', icon: 'globe' });
 
       try {
@@ -298,8 +296,8 @@ router.post('/', async (req, res) => {
       }))
       .filter(m => m.content.trim().length > 0);
 
-    // FIX : le message user courant est buildé avec ses pièces jointes
-    // Les messages précédents restent en string (historique sans médias)
+    // Le message user courant est buildé avec ses pièces jointes (format Anthropic).
+    // openrouter.js convertira automatiquement en format OpenAI si multimodal.
     const userContent = buildUserContent(message, attachments);
 
     const messages = [
@@ -320,7 +318,6 @@ router.post('/', async (req, res) => {
       onChunk: (chunk) => {
         streamedContent = chunk;
 
-        // Gestion bloc <thinking>
         const thinkMatch = streamedContent.match(/<thinking>([\s\S]*)/);
         if (thinkMatch) {
           const partial = thinkMatch[1];
@@ -338,7 +335,6 @@ router.post('/', async (req, res) => {
           }
         }
 
-        // Attendre la fin du bloc <thinking> avant d'envoyer le contenu affiché
         if (!streamedContent.includes('</thinking>')) return;
 
         const displayContent = streamedContent
