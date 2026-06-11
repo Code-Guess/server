@@ -16,6 +16,12 @@ const OPENROUTER_MODELS = {
   haiku:  'openai/gpt-oss-120b:free',
 };
 
+/**
+ * Quand des images sont détectées, on utilise openrouter/free qui route
+ * automatiquement vers un modèle gratuit supportant la vision.
+ */
+const VISION_FALLBACK = 'openrouter/free';
+
 /** Limite de tokens par tier. */
 const MAX_TOKENS = {
   opus:   16_000,
@@ -25,40 +31,80 @@ const MAX_TOKENS = {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/**
- * Retourne les clés API disponibles.
- * @throws {Error} Si aucune clé n'est configurée.
- */
 function getAvailableKeys() {
   if (KEYS.length === 0) throw new Error('Aucune clé OpenRouter configurée.');
   return KEYS;
 }
 
-// ─── Core fetch ───────────────────────────────────────────────────────────────
+/**
+ * Retourne true si l'un des messages contient un bloc image ou document.
+ */
+function hasMultimodalContent(messages) {
+  if (!Array.isArray(messages)) return false;
+  return messages.some(m => {
+    if (!Array.isArray(m.content)) return false;
+    return m.content.some(block =>
+      block.type === 'image' || block.type === 'document'
+    );
+  });
+}
 
 /**
- * Envoie une requête streaming à OpenRouter et reconstruit la réponse complète.
+ * Convertit les blocs Anthropic en blocs OpenAI-vision pour OpenRouter.
  *
- * Note : le paramètre `thinking:enabled` est volontairement absent.
- * Lorsqu'il est transmis à owl-alpha, le modèle ignore le rôle "system".
- * Le bloc <thinking> dans les réponses provient du prompt texte, pas de ce flag.
+ * Anthropic : { type: 'image', source: { type: 'base64', media_type, data } }
+ * OpenAI    : { type: 'image_url', image_url: { url: 'data:...;base64,...' } }
  *
- * @param {object}   options
- * @param {string}   [options.model='opus']      - Tier : 'opus' | 'sonnet' | 'haiku'
- * @param {object[]} options.messages            - Historique de messages (format OpenAI)
- * @param {number}   [options.max_tokens]        - Surcharge du quota de tokens
- * @param {number}   [options.temperature=0.7]   - Température de génération
- * @param {Function} [options.onChunk]           - Callback appelé à chaque token reçu (contenu cumulé)
- * @returns {Promise<{ content: string, reasoning: string, modelUsed: string }>}
+ * Les blocs 'document' (PDF) sont dégradés en texte car OpenRouter
+ * ne passe pas les PDFs base64 natifs aux modèles via leur API vision.
  */
+function convertToOpenAIFormat(messages) {
+  return messages.map(m => {
+    if (!Array.isArray(m.content)) return m;
+
+    const converted = m.content.map(block => {
+      if (block.type === 'image' && block.source?.type === 'base64') {
+        return {
+          type: 'image_url',
+          image_url: {
+            url: `data:${block.source.media_type};base64,${block.source.data}`,
+          },
+        };
+      }
+      if (block.type === 'document' && block.source?.type === 'base64') {
+        return {
+          type: 'text',
+          text: `[Document PDF joint — analyse son contenu si possible]`,
+        };
+      }
+      return block;
+    });
+
+    return { ...m, content: converted };
+  });
+}
+
+// ─── Core fetch ───────────────────────────────────────────────────────────────
+
 async function openRouterFetch(options) {
   const keys = getAvailableKeys();
 
   const tier      = options.model ?? 'opus';
-  const model     = OPENROUTER_MODELS[tier] ?? OPENROUTER_MODELS.opus;
   const maxTokens = options.max_tokens ?? MAX_TOKENS[tier] ?? 16_000;
 
-  console.log(`[OpenRouter] Streaming ${model} | max_tokens=${maxTokens} | messages=${options.messages?.length}`);
+  // Détecter si des pièces jointes multimodales sont présentes
+  const isMultimodal = hasMultimodalContent(options.messages ?? []);
+
+  const model = isMultimodal
+    ? VISION_FALLBACK
+    : (OPENROUTER_MODELS[tier] ?? OPENROUTER_MODELS.opus);
+
+  // Convertir le format Anthropic → OpenAI si nécessaire
+  const messages = isMultimodal
+    ? convertToOpenAIFormat(options.messages)
+    : options.messages;
+
+  console.log(`[OpenRouter] Streaming ${model} | multimodal=${isMultimodal} | max_tokens=${maxTokens} | messages=${messages?.length}`);
 
   const res = await fetch(BASE_URL, {
     method: 'POST',
@@ -70,7 +116,7 @@ async function openRouterFetch(options) {
     },
     body: JSON.stringify({
       model,
-      messages:    options.messages,
+      messages,
       max_tokens:  maxTokens,
       temperature: options.temperature ?? 0.7,
       stream:      true,
@@ -109,7 +155,7 @@ async function openRouterFetch(options) {
         if (delta?.content)   { content   += delta.content;   options.onChunk?.(content); }
         if (delta?.reasoning) { reasoning += delta.reasoning; }
       } catch {
-        // chunk malformé → on ignore silencieusement
+        // chunk malformé → on ignore
       }
     }
   }
