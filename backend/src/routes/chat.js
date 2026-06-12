@@ -1,24 +1,25 @@
+'use strict';
+
 // src/routes/chat.js
 // ─────────────────────────────────────────────────────────────────────────────
 // Support des pièces jointes (images + PDF) avec détection multimodale
 // La conversion Anthropic → OpenAI est gérée dans openrouter.js
+// Le prefill arith-table est géré automatiquement dans openrouter.js
 // ─────────────────────────────────────────────────────────────────────────────
 
 const express = require('express');
 const router  = express.Router();
+
 const { openRouterFetch }                    = require('../openrouter');
 const { getSystemPrompt }                    = require('../prompts');
 const { runSearchAgent }                     = require('../agents/searchAgents');
 const { runCodePipeline, needsCodePipeline } = require('../agents/codeAgents');
 const { runAgentLoop, needsAgentLoop }       = require('../tools/agentLoop');
 
-// ── Types MIME acceptés par l'API Anthropic ───────────────────────────────────
+// ── Types MIME acceptés ───────────────────────────────────────────────────────
+
 const ACCEPTED_IMAGE_TYPES = new Set([
-  'image/jpeg',
-  'image/jpg',
-  'image/png',
-  'image/gif',
-  'image/webp',
+  'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp',
 ]);
 
 const ACCEPTED_DOC_TYPES = new Set([
@@ -26,13 +27,9 @@ const ACCEPTED_DOC_TYPES = new Set([
 ]);
 
 // ── Construction du contenu user avec pièces jointes ─────────────────────────
-// Retourne une string simple si pas de pièces jointes,
-// ou un array de blocs Anthropic si des attachments sont présents.
-// openrouter.js se charge ensuite de convertir au format OpenAI si nécessaire.
+
 function buildUserContent(message, attachments = []) {
-  if (!attachments || attachments.length === 0) {
-    return message;
-  }
+  if (!attachments || attachments.length === 0) return message;
 
   const blocks = [];
 
@@ -45,68 +42,43 @@ function buildUserContent(message, attachments = []) {
     if (att.type === 'image') {
       let mimeType = att.mimeType.toLowerCase();
       if (mimeType === 'image/jpg') mimeType = 'image/jpeg';
-
       if (!ACCEPTED_IMAGE_TYPES.has(mimeType)) {
         console.warn('[chat] Image ignorée — mimeType non supporté :', mimeType);
         continue;
       }
-
       blocks.push({
         type: 'image',
-        source: {
-          type:       'base64',
-          media_type: mimeType,
-          data:       att.base64,
-        },
+        source: { type: 'base64', media_type: mimeType, data: att.base64 },
       });
 
     } else if (att.type === 'document') {
       let mimeType = att.mimeType.toLowerCase();
-
-      if (
-        mimeType === 'application/octet-stream' ||
-        mimeType === 'application/x-unknown' ||
-        mimeType === ''
-      ) {
-        if (att.name && att.name.toLowerCase().endsWith('.pdf')) {
+      if (['application/octet-stream', 'application/x-unknown', ''].includes(mimeType)) {
+        if (att.name?.toLowerCase().endsWith('.pdf')) {
           mimeType = 'application/pdf';
         } else {
           console.warn('[chat] Document ignoré — mimeType non déterminable :', att.name);
           continue;
         }
       }
-
       if (!ACCEPTED_DOC_TYPES.has(mimeType)) {
         console.warn('[chat] Document ignoré — mimeType non supporté :', mimeType);
         continue;
       }
-
       blocks.push({
         type: 'document',
-        source: {
-          type:       'base64',
-          media_type: mimeType,
-          data:       att.base64,
-        },
+        source: { type: 'base64', media_type: mimeType, data: att.base64 },
       });
     }
   }
 
-  if (blocks.length === 0) {
-    return message;
-  }
-
-  if (message && message.trim().length > 0) {
-    blocks.push({
-      type: 'text',
-      text: message,
-    });
-  }
-
+  if (blocks.length === 0) return message;
+  if (message?.trim().length > 0) blocks.push({ type: 'text', text: message });
   return blocks;
 }
 
-// ── Requêtes qui ne nécessitent PAS de recherche web ─────────────────────────
+// ── Détection de la nécessité d'une recherche web ────────────────────────────
+
 const NO_SEARCH_PATTERNS = [
   /^(bonjour|salut|hello|hi|hey|bonsoir|coucou)\b/i,
   /^(merci|thanks|thank you)\b/i,
@@ -121,6 +93,8 @@ function needsSearch(query) {
   if (q.length < 8) return false;
   return !NO_SEARCH_PATTERNS.some(re => re.test(q));
 }
+
+// ── Helpers affichage recherche ───────────────────────────────────────────────
 
 function getAgentLabel(agent) {
   switch (agent) {
@@ -144,6 +118,8 @@ function buildSearchSummary(searchResult) {
   return `J'ai trouvé ${count} ${label} :\n${titles}${count > 3 ? `\n• … et ${count - 3} de plus` : ''}\n\nJe synthétise maintenant…`;
 }
 
+// ── Parser les étapes de thinking partiel ────────────────────────────────────
+
 function parseStepsFromPartial(partial) {
   const completions = [partial, partial + ']}', partial + '"]}', partial + '"}]}'];
   for (const attempt of completions) {
@@ -163,6 +139,16 @@ function parseStepsFromPartial(partial) {
   return [];
 }
 
+// ── Nettoyage du contenu affiché (retire les balises <thinking>) ──────────────
+
+function stripThinking(content) {
+  return content
+    .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
+    .trimStart();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Route principale
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.post('/', async (req, res) => {
@@ -181,16 +167,17 @@ router.post('/', async (req, res) => {
   }
 
   if (attachments.length > 0) {
-    console.log(`[chat] ${attachments.length} pièce(s) jointe(s) reçue(s) :`,
+    console.log(
+      `[chat] ${attachments.length} pièce(s) jointe(s) :`,
       attachments.map(a =>
-        `${a.name} (${a.type}, ${a.mimeType}, base64: ${a.base64
-          ? Math.round(a.base64.length / 1024) + ' Ko'
-          : 'ABSENT ← problème'
+        `${a.name} (${a.type}, ${a.mimeType}, ${
+          a.base64 ? Math.round(a.base64.length / 1024) + ' Ko' : 'ABSENT'
         })`
       ).join(', ')
     );
   }
 
+  // ── SSE setup ─────────────────────────────────────────────────────────────
   res.setHeader('Content-Type',      'text/event-stream');
   res.setHeader('Cache-Control',     'no-cache');
   res.setHeader('Connection',        'keep-alive');
@@ -198,7 +185,18 @@ router.post('/', async (req, res) => {
   res.flushHeaders();
 
   const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-  const done = () => { res.write('data: [DONE]\n\n'); res.end(); };
+  const done = ()      => { res.write('data: [DONE]\n\n'); res.end(); };
+
+  // ── Helper : construction des messages history ────────────────────────────
+  function buildHistory() {
+    return (history ?? [])
+      .filter(m => m.role && m.content)
+      .map(m => ({
+        role:    m.role,
+        content: m.role === 'assistant' ? stripThinking(m.content) : m.content,
+      }))
+      .filter(m => m.content.trim().length > 0);
+  }
 
   try {
 
@@ -216,22 +214,11 @@ router.post('/', async (req, res) => {
     // ── 2. Agent loop (execute_code / edit_file) ──────────────────────────────
     if (!deepResearch && needsAgentLoop(message)) {
       const systemPrompt = getSystemPrompt(message, undefined);
-
-      const previousMessages = (history ?? [])
-        .filter(m => m.role && m.content)
-        .map(m => ({
-          role:    m.role,
-          content: m.role === 'assistant'
-            ? m.content.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '').trimStart()
-            : m.content,
-        }))
-        .filter(m => m.content.trim().length > 0);
-
-      const userContent = buildUserContent(message, attachments);
+      const userContent  = buildUserContent(message, attachments);
 
       const messages = [
         { role: 'system', content: systemPrompt },
-        ...previousMessages,
+        ...buildHistory(),
         { role: 'user', content: userContent },
       ];
 
@@ -245,12 +232,9 @@ router.post('/', async (req, res) => {
       return;
     }
 
-    // ── 3. Recherche systématique ─────────────────────────────────────────────
+    // ── 3. Recherche web ──────────────────────────────────────────────────────
     let systemContext = '';
     let sources       = [];
-
-    // On ne recherche pas si le message est court ou vide (l'utilisateur
-    // a peut-être seulement envoyé une image sans texte)
     const shouldSearch = message.trim().length >= 8 && needsSearch(message);
 
     if (shouldSearch) {
@@ -274,7 +258,7 @@ router.post('/', async (req, res) => {
           send({ type: 'searching', status: 'done', label: summary, icon: 'globe', count: sources.length, agent: searchResult.agent });
 
         } else {
-          send({ type: 'searching', status: 'done', label: 'Aucun résultat trouvé — je réponds avec mes connaissances.', icon: 'globe' });
+          send({ type: 'searching', status: 'done', label: 'Aucun résultat — je réponds avec mes connaissances.', icon: 'globe' });
         }
 
       } catch (err) {
@@ -283,30 +267,17 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // ── 4. Construction du prompt ─────────────────────────────────────────────
+    // ── 4. Construction des messages ──────────────────────────────────────────
     const systemPrompt = getSystemPrompt(message, systemContext || undefined);
-
-    const previousMessages = (history ?? [])
-      .filter(m => m.role && m.content)
-      .map(m => ({
-        role:    m.role,
-        content: m.role === 'assistant'
-          ? m.content.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '').trimStart()
-          : m.content,
-      }))
-      .filter(m => m.content.trim().length > 0);
-
-    // Le message user courant est buildé avec ses pièces jointes (format Anthropic).
-    // openrouter.js convertira automatiquement en format OpenAI si multimodal.
-    const userContent = buildUserContent(message, attachments);
+    const userContent  = buildUserContent(message, attachments);
 
     const messages = [
       { role: 'system', content: systemPrompt },
-      ...previousMessages,
+      ...buildHistory(),
       { role: 'user', content: userContent },
     ];
 
-    // ── 5. Appel LLM en streaming ─────────────────────────────────────────────
+    // ── 5. Appel LLM (prefill arith-table géré automatiquement dans openrouter.js)
     let streamedContent = '';
 
     const result = await openRouterFetch({
@@ -315,9 +286,10 @@ router.post('/', async (req, res) => {
       temperature: temperature ?? 0.7,
       messages,
 
-      onChunk: (chunk) => {
-        streamedContent = chunk;
+      onChunk: (fullContent) => {
+        streamedContent = fullContent;
 
+        // Thinking steps
         const thinkMatch = streamedContent.match(/<thinking>([\s\S]*)/);
         if (thinkMatch) {
           const partial = thinkMatch[1];
@@ -335,25 +307,19 @@ router.post('/', async (req, res) => {
           }
         }
 
+        // N'envoyer le contenu affiché qu'une fois le thinking fermé
         if (!streamedContent.includes('</thinking>')) return;
 
-        const displayContent = streamedContent
-          .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
-          .trimStart();
-
+        const displayContent = stripThinking(streamedContent);
         if (!displayContent) return;
+
         send({ type: 'chunk', content: displayContent });
       },
     });
 
-    // Flush final
-    const finalDisplay = streamedContent
-      .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
-      .trimStart();
-
-    if (finalDisplay) {
-      send({ type: 'chunk', content: finalDisplay });
-    }
+    // Flush final garanti
+    const finalDisplay = stripThinking(streamedContent);
+    if (finalDisplay) send({ type: 'chunk', content: finalDisplay });
 
     send({ type: 'done', modelUsed: result.modelUsed });
     done();
