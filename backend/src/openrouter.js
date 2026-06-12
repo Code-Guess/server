@@ -9,25 +9,97 @@ const KEYS = [
   process.env.OPENROUTER_KEY_2,
 ].filter(Boolean);
 
-/** Modèles disponibles par niveau (tier). */
 const OPENROUTER_MODELS = {
   opus:   'openrouter/owl-alpha',
   sonnet: 'openrouter/owl-alpha',
   haiku:  'openai/gpt-oss-120b:free',
 };
 
-/**
- * Quand des images sont détectées, on utilise openrouter/free qui route
- * automatiquement vers un modèle gratuit supportant la vision.
- */
 const VISION_FALLBACK = 'openrouter/free';
 
-/** Limite de tokens par tier. */
 const MAX_TOKENS = {
   opus:   16_000,
   sonnet: 16_000,
   haiku:  4_096,
 };
+
+// ─── Arith Prefill ────────────────────────────────────────────────────────────
+
+const ARITH_TRIGGERS = [
+  // Conversion de base
+  {
+    regex:   /(?:écrire?|convertir?|exprimer?|donner?|passer?).{0,50}base\s*\d+/i,
+    prefill: '```arith-table\n{"kind":"base-conversion",',
+  },
+  {
+    regex:   /base\s*(?:1[0-6]|[2-9])\b/i,
+    prefill: '```arith-table\n{"kind":"base-conversion",',
+  },
+  {
+    regex:   /\(\s*\d+\s*\)\s*_?\s*\d+/,
+    prefill: '```arith-table\n{"kind":"base-conversion",',
+  },
+  // Binaire (addition / multiplication)
+  {
+    regex:   /(?:addition|multiplica|opéra).{0,30}(?:binaire|base\s*2)/i,
+    prefill: '```arith-table\n{"kind":"binary-operation",',
+  },
+  {
+    regex:   /binaire|base\s*2/i,
+    prefill: '```arith-table\n{"kind":"base-conversion",',
+  },
+  // Euclide / PGCD
+  {
+    regex:   /pgcd|euclide|algorithme\s+d.euclide/i,
+    prefill: '```arith-table\n{"kind":"euclid-algorithm",',
+  },
+  // Bézout
+  {
+    regex:   /b[eé]zout/i,
+    prefill: '```arith-table\n{"kind":"bezout-table",',
+  },
+  // Factorisation
+  {
+    regex:   /factori(?:ser?|sation)|décompos.{0,30}premier/i,
+    prefill: '```arith-table\n{"kind":"prime-factorization",',
+  },
+  // Crible d'Ératosthène
+  {
+    regex:   /crible|[eé]ratosth[eè]ne/i,
+    prefill: '```arith-table\n{"kind":"sieve-eratosthenes",',
+  },
+  // Diviseurs
+  {
+    regex:   /diviseurs?\s+de\s+\d+/i,
+    prefill: '```arith-table\n{"kind":"divisors-search",',
+  },
+  // Table d'opération binaire
+  {
+    regex:   /table\s+(?:d.addition|de\s+multiplication).{0,20}(?:binaire|base\s*2)/i,
+    prefill: '```arith-table\n{"kind":"binary-op-table",',
+  },
+];
+
+/**
+ * Cherche dans le dernier message user si une figure arith-table est requise.
+ * Retourne le préfixe à injecter ou null.
+ */
+function getArithPrefill(messages) {
+  const lastUser = [...messages].reverse().find(m => m.role === 'user');
+  if (!lastUser) return null;
+
+  const text =
+    typeof lastUser.content === 'string'
+      ? lastUser.content
+      : Array.isArray(lastUser.content)
+        ? (lastUser.content.find(b => b.type === 'text')?.text ?? '')
+        : '';
+
+  for (const trigger of ARITH_TRIGGERS) {
+    if (trigger.regex.test(text)) return trigger.prefill;
+  }
+  return null;
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -36,28 +108,14 @@ function getAvailableKeys() {
   return KEYS;
 }
 
-/**
- * Retourne true si l'un des messages contient un bloc image ou document.
- */
 function hasMultimodalContent(messages) {
   if (!Array.isArray(messages)) return false;
   return messages.some(m => {
     if (!Array.isArray(m.content)) return false;
-    return m.content.some(block =>
-      block.type === 'image' || block.type === 'document'
-    );
+    return m.content.some(b => b.type === 'image' || b.type === 'document');
   });
 }
 
-/**
- * Convertit les blocs Anthropic en blocs OpenAI-vision pour OpenRouter.
- *
- * Anthropic : { type: 'image', source: { type: 'base64', media_type, data } }
- * OpenAI    : { type: 'image_url', image_url: { url: 'data:...;base64,...' } }
- *
- * Les blocs 'document' (PDF) sont dégradés en texte car OpenRouter
- * ne passe pas les PDFs base64 natifs aux modèles via leur API vision.
- */
 function convertToOpenAIFormat(messages) {
   return messages.map(m => {
     if (!Array.isArray(m.content)) return m;
@@ -74,7 +132,7 @@ function convertToOpenAIFormat(messages) {
       if (block.type === 'document' && block.source?.type === 'base64') {
         return {
           type: 'text',
-          text: `[Document PDF joint — analyse son contenu si possible]`,
+          text: '[Document PDF joint — analyse son contenu si possible]',
         };
       }
       return block;
@@ -92,20 +150,29 @@ async function openRouterFetch(options) {
   const tier      = options.model ?? 'opus';
   const maxTokens = options.max_tokens ?? MAX_TOKENS[tier] ?? 16_000;
 
-  // Détecter si des pièces jointes multimodales sont présentes
   const isMultimodal = hasMultimodalContent(options.messages ?? []);
 
   const model = isMultimodal
     ? VISION_FALLBACK
     : (OPENROUTER_MODELS[tier] ?? OPENROUTER_MODELS.opus);
 
-  // Convertir le format Anthropic → OpenAI si nécessaire
-  const messages = isMultimodal
+  // Convertir le format si multimodal
+  let messages = isMultimodal
     ? convertToOpenAIFormat(options.messages)
     : options.messages;
 
-  console.log(`[OpenRouter] Streaming ${model} | multimodal=${isMultimodal} | max_tokens=${maxTokens} | messages=${messages?.length}`);
+  // ── Prefill arith-table ──────────────────────────────────────────────────
+  const prefill = isMultimodal ? null : getArithPrefill(messages);
 
+  if (prefill) {
+    messages = [...messages, { role: 'assistant', content: prefill }];
+  }
+
+  console.log(
+    `[OpenRouter] model=${model} | prefill=${prefill ? 'oui' : 'non'} | multimodal=${isMultimodal} | max_tokens=${maxTokens} | messages=${messages.length}`
+  );
+
+  // ── Appel API ────────────────────────────────────────────────────────────
   const res = await fetch(BASE_URL, {
     method: 'POST',
     headers: {
@@ -152,15 +219,27 @@ async function openRouterFetch(options) {
         const { choices } = JSON.parse(payload);
         const delta = choices?.[0]?.delta;
 
-        if (delta?.content)   { content   += delta.content;   options.onChunk?.(content); }
-        if (delta?.reasoning) { reasoning += delta.reasoning; }
+        if (delta?.content) {
+          content += delta.content;
+          options.onChunk?.(content);
+        }
+        if (delta?.reasoning) {
+          reasoning += delta.reasoning;
+        }
       } catch {
         // chunk malformé → on ignore
       }
     }
   }
 
-  return { content, reasoning, modelUsed: model };
+  // ── Recoller le prefill si OpenRouter ne le répète pas ──────────────────
+  // OpenRouter n'inclut PAS le message assistant prefill dans le stream,
+  // donc on le recolle toujours en tête du contenu final.
+  const finalContent = prefill
+    ? prefill + content
+    : content;
+
+  return { content: finalContent, reasoning, modelUsed: model };
 }
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
