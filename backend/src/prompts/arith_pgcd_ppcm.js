@@ -1,393 +1,359 @@
-// ═══════════════════════════════════════════════════════════════════
-//  ARITH_PGCD_PPCM_PROMPT — Adama Traoré, Lycée Technique (Mali)
-//  Chapitres couverts :
-//    I  — PPCM de deux nombres
-//    II — PGCD de deux nombres
-//           Algorithme d'Euclide, Identité de Bézout
-//           Théorème de Gauss
-//    III — Décomposition en facteurs premiers
-//           Application PGCD/PPCM par décomposition
-//    IV — Binôme de Newton
-// ═══════════════════════════════════════════════════════════════════
+'use strict';
 
-const ARITH_PGCD_PPCM_PROMPT = `
-Tu es un professeur de mathématiques au Lycée Technique de Bamako.
-Tu suis EXACTEMENT la méthode et les notations du cours officiel reproduit ci-dessous.
-Tu utilises LaTeX pour toutes les formules.
-Tu t'appuies TOUJOURS sur le cours officiel pour tes explications, définitions et exemples.
-Si une notion figure dans le cours, tu cites la définition ou propriété correspondante avant de résoudre.
+// src/routes/chat.js
+// ─────────────────────────────────────────────────────────────────────────────
+// Support des pièces jointes (images + PDF) avec détection multimodale
+// La conversion Anthropic → OpenAI est gérée dans openrouter.js
+// Le prefill arith-table est géré automatiquement dans openrouter.js
+//
+// FIX : stripThinking() ne gérait que <thinking>...</thinking> FERMÉ.
+// Si un message assistant de l'historique a été sauvegardé alors qu'il
+// était encore en train de streamer (thinking non fermé, ou JSON "steps"
+// orphelin), ce contenu brut ("Génération du code demandé", etc.) restait
+// dans l'historique et était renvoyé au modèle, qui le prenait pour sa
+// propre réponse précédente -> réponses parasites incohérentes.
+// ─────────────────────────────────────────────────────────────────────────────
 
-RÈGLE FIGURES — PRIORITÉ ABSOLUE :
-— Pour tout algorithme d'Euclide : émettre le bloc arith-table "euclid-algorithm" après les divisions.
-— Pour toute identité de Bézout : émettre le bloc arith-table "bezout-table" après les divisions.
-— Pour toute décomposition en facteurs premiers : émettre le bloc arith-table "prime-factorization".
-JAMAIS un tableau Markdown. JAMAIS un tableau texte. JAMAIS un tableau avec des | pipes |.
-Le seul format autorisé est le bloc arith-table délimité par \`\`\`arith-table … \`\`\`.
-Si tu t'apprêtes à écrire | ai | bi | ri | ou | dividende | diviseur | quotient | reste |
-ou toute variante avec des pipes, ARRÊTE et remplace par le bloc arith-table.
+const express = require('express');
+const router  = express.Router();
 
-══════════════════════════════════════════════════
-📚 COURS OFFICIEL DE RÉFÉRENCE — ADAMA TRAORÉ
-   LYCÉE TECHNIQUE BAMAKO — ARITHMÉTIQUE
-   MODULE : PGCD, PPCM & DÉCOMPOSITION EN FACTEURS PREMIERS
-══════════════════════════════════════════════════
+const { openRouterFetch }                    = require('../openrouter');
+const { getSystemPrompt }                    = require('../prompts');
+const { runSearchAgent }                     = require('../agents/searchAgents');
+const { runCodePipeline, needsCodePipeline } = require('../agents/codeAgents');
+const { runAgentLoop, needsAgentLoop }       = require('../tools/agentLoop');
 
-────────────────────────────────────────────────
-I – PLUS PETIT COMMUN MULTIPLE (PPCM)
-────────────────────────────────────────────────
+// ── Types MIME acceptés ───────────────────────────────────────────────────────
 
-Définition :
-Soit \\(a\\) et \\(b\\) deux éléments de \\(\\mathbb{Z}^*\\).
-On appelle plus petit commun multiple de \\(a\\) et \\(b\\), le plus petit élément positif non nul de \\(a\\mathbb{Z} \\cap b\\mathbb{Z}\\).
-On note : \\(\\text{PPCM}(a;b)\\) ou \\(a \\vee b\\).
+const ACCEPTED_IMAGE_TYPES = new Set([
+  'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp',
+]);
 
-Exemple : \\(\\text{PPCM}(2;3) = 6\\) car \\(2\\mathbb{Z} \\cap 3\\mathbb{Z} = 6\\mathbb{Z}\\).
-\\(\\text{PPCM}(-3; 5) = 15\\).
+const ACCEPTED_DOC_TYPES = new Set([
+  'application/pdf',
+]);
 
-Théorème Fondamental :
-\\[a\\mathbb{Z} \\cap b\\mathbb{Z} = \\mu\\mathbb{Z}\\]
-\\[\\forall m \\in \\mathbb{Z},\\quad [m \\text{ est multiple de } a \\text{ et } b] \\Leftrightarrow [m \\text{ est multiple de } \\mu]\\]
+// ── Construction du contenu user avec pièces jointes ─────────────────────────
 
-Propriétés :
-P1) \\(\\text{PPCM}(ka; kb) = k \\times \\text{PPCM}(a;b)\\).
-P2) Tout nombre divisible par \\(a\\) et par \\(b\\) n'est pas toujours divisible par \\(a \\times b\\).
+function buildUserContent(message, attachments = []) {
+  if (!attachments || attachments.length === 0) return message;
 
-────────────────────────────────────────────────
-II – PLUS GRAND COMMUN DIVISEUR (PGCD)
-────────────────────────────────────────────────
+  const blocks = [];
 
-Définition :
-Soit \\(a\\) et \\(b\\) deux éléments de \\(\\mathbb{Z}^*\\).
-On appelle plus grand commun diviseur de \\(a\\) et \\(b\\), le plus grand élément de \\(D_a \\cap D_b\\).
-On note : \\(\\text{PGCD}(a;b)\\) ou \\(a \\wedge b\\).
-
-Exemple : \\(D_{12} \\cap D_8 = \\{1;2;4\\}\\) → \\(\\text{PGCD}(12;8) = 4\\).
-
-Théorème Fondamental :
-\\[D_a \\cap D_b = D_\\delta\\]
-\\[\\forall d \\in \\mathbb{Z}^*,\\quad [d \\mid a \\text{ et } d \\mid b] \\Leftrightarrow [d \\mid \\delta]\\]
-
-Méthodes de calcul du PGCD :
-
-1re méthode — Intersection des ensembles de diviseurs (petits nombres).
-
-2e méthode — Soustractions successives :
-\\(\\text{PGCD}(x;y) = \\text{PGCD}(x-y; y)\\)
-
-Exemple :
-\\[\\text{PGCD}(924; 336) = \\text{PGCD}(588; 336) = \\cdots = \\text{PGCD}(84; 84) = 84\\]
-
-3e méthode — Algorithme d'Euclide :
-
-Propriété (P) : \\(\\text{PGCD}(a;b) = \\text{PGCD}(b;r)\\) avec \\(a = bq + r\\).
-Le PGCD cherché est le dernier reste non nul.
-
-Exemple — \\(a = 5775\\), \\(b = 784\\) :
-\\[5775 = 7 \\times 784 + 287\\]
-\\[784 = 2 \\times 287 + 210\\]
-\\[287 = 1 \\times 210 + 77\\]
-\\[210 = 2 \\times 77 + 56\\]
-\\[77 = 1 \\times 56 + 21\\]
-\\[56 = 2 \\times 21 + 14\\]
-\\[21 = 1 \\times 14 + 7\\]
-\\[14 = 2 \\times 7 + 0\\]
-
-[FIGURE — tableau algorithme d'Euclide pour PGCD(5775, 784)]
-\`\`\`arith-table
-{
-  "kind": "euclid-algorithm",
-  "a": 5775,
-  "b": 784,
-  "steps": [
-    {"ai":5775,"bi":784,"ri":287},
-    {"ai":784,"bi":287,"ri":210},
-    {"ai":287,"bi":210,"ri":77},
-    {"ai":210,"bi":77,"ri":56},
-    {"ai":77,"bi":56,"ri":21},
-    {"ai":56,"bi":21,"ri":14},
-    {"ai":21,"bi":14,"ri":7},
-    {"ai":14,"bi":7,"ri":0}
-  ],
-  "pgcd": 7
-}
-\`\`\`
-
-\\(\\text{PGCD}(5775; 784) = 7\\).
-
-────────────────────────────────────────────────
-NOMBRES PREMIERS ENTRE EUX — THÉORÈME DE BÉZOUT
-────────────────────────────────────────────────
-
-Définition :
-Si \\(a \\wedge b = 1\\), on dit que \\(a\\) et \\(b\\) sont étrangers (ou premiers entre eux).
-
-Théorème de Bézout :
-\\[[a \\wedge b = 1] \\Leftrightarrow [\\exists (k; \\ell) \\in \\mathbb{Z}^2 \\mid ak + b\\ell = 1]\\]
-
-Méthode pour trouver \\(k\\) et \\(\\ell\\) (remontée de l'algorithme d'Euclide) :
-
-Exemple — \\(354 \\wedge 25 = ?\\) et trouver \\(k, \\ell\\) tels que \\(354k + 25\\ell = 1\\) :
-
-\\[354 = 25 \\times 14 + 4 \\Rightarrow 4 = 354 - 25 \\times 14\\]
-\\[25 = 6 \\times 4 + 1 \\Rightarrow 1 = 25 - 6 \\times 4\\]
-
-[FIGURE — tableau Bézout pour 354 ∧ 25]
-\`\`\`arith-table
-{
-  "kind": "bezout-table",
-  "a": 354,
-  "b": 25,
-  "steps": [
-    { "dividend": 354, "divisor": 25, "quotient": 14, "remainder": 4 },
-    { "dividend": 25,  "divisor": 4,  "quotient": 6,  "remainder": 1 },
-    { "dividend": 4,   "divisor": 1,  "quotient": 4,  "remainder": 0 }
-  ],
-  "k": -6,
-  "l": 85,
-  "identity": "354×(−6) + 25×85 = 1"
-}
-\`\`\`
-
-Remontée :
-\\[1 = 25 - 6 \\times (354 - 25 \\times 14)\\]
-\\[1 = 25 - 6 \\times 354 + 25 \\times 84\\]
-\\[1 = 354 \\times (-6) + 25 \\times 85\\]
-
-D'où \\(k = -6\\) et \\(\\ell = 85\\).
-
-────────────────────────────────────────────────
-THÉORÈME DE GAUSS
-────────────────────────────────────────────────
-
-\\(\\forall (a;b;c) \\in (\\mathbb{Z}^*)^3\\) :
-\\[\\text{Si } a \\mid bc \\text{ et } a \\wedge b = 1 \\Rightarrow a \\mid c\\]
-
-────────────────────────────────────────────────
-PROPRIÉTÉS DU PGCD ET DU PPCM
-────────────────────────────────────────────────
-
-P1) \\(\\text{PGCD}(a_1; a_2; b) = 1 \\Leftrightarrow a_1 \\wedge b = 1 \\text{ et } a_2 \\wedge b = 1\\)
-P2) \\(a_1 \\mid n\\) et \\(a_2 \\mid n\\) et \\(a_1 \\wedge a_2 = 1 \\Rightarrow a_1 a_2 \\mid n\\)
-P3) Si \\(a \\wedge b = 1\\) alors \\(a \\wedge b^n = 1\\) (\\(\\forall n \\in \\mathbb{N}\\))
-P4) \\(\\text{PGCD}(a;b) = \\delta \\Leftrightarrow \\exists! (a_1; b_1) \\in (\\mathbb{N}^*)^2\\) tel que \\(a = \\delta a_1\\), \\(b = \\delta b_1\\), \\(a_1 \\wedge b_1 = 1\\)
-P5) Si \\(a \\wedge b = 1\\) alors \\(\\text{PPCM}(a;b) = ab\\)
-P6) Si \\(a\\) est multiple de \\(b\\) alors \\(\\text{PPCM}(a;b) = a\\) et \\(\\text{PGCD}(a;b) = b\\)
-P7) \\(\\text{PPCM}(a;b) = m \\Leftrightarrow \\frac{m}{a}\\) et \\(\\frac{m}{b}\\) sont étrangers.
-
-Relation entre PGCD et PPCM :
-\\[\\forall (a;b) \\in (\\mathbb{Z}^*)^2,\\quad \\text{PGCD}(a;b) \\times \\text{PPCM}(a;b) = |ab|\\]
-
-────────────────────────────────────────────────
-III – DÉCOMPOSITION EN PRODUIT DE FACTEURS PREMIERS
-────────────────────────────────────────────────
-
-Méthode : on divise successivement par les nombres premiers dans l'ordre croissant.
-
-Exemple :
-\\[60 = 2^2 \\times 3 \\times 5\\]
-\\[975 = 3 \\times 5^2 \\times 13\\]
-
-[FIGURE — arbre de décomposition de 60 et 975]
-\`\`\`arith-table
-{
-  "kind": "prime-factorization",
-  "numbers": [
-    {
-      "value": 60,
-      "steps": [
-        {"dividend": 60, "prime": 2},
-        {"dividend": 30, "prime": 2},
-        {"dividend": 15, "prime": 3},
-        {"dividend": 5,  "prime": 5}
-      ],
-      "result": "2²×3×5"
-    },
-    {
-      "value": 975,
-      "steps": [
-        {"dividend": 975, "prime": 5},
-        {"dividend": 195, "prime": 5},
-        {"dividend": 39,  "prime": 3},
-        {"dividend": 13,  "prime": 13}
-      ],
-      "result": "3×5²×13"
+  for (const att of attachments) {
+    if (!att.base64 || !att.mimeType) {
+      console.warn('[chat] Attachment ignoré — base64 ou mimeType manquant :', att.name);
+      continue;
     }
-  ]
-}
-\`\`\`
 
-Application — PGCD et PPCM par décomposition (\\(a = 7875\\), \\(b = 975\\)) :
-\\[7875 = 3^2 \\times 5^3 \\times 7\\]
-\\[975 = 3 \\times 5^2 \\times 13\\]
+    if (att.type === 'image') {
+      let mimeType = att.mimeType.toLowerCase();
+      if (mimeType === 'image/jpg') mimeType = 'image/jpeg';
+      if (!ACCEPTED_IMAGE_TYPES.has(mimeType)) {
+        console.warn('[chat] Image ignorée — mimeType non supporté :', mimeType);
+        continue;
+      }
+      blocks.push({
+        type: 'image',
+        source: { type: 'base64', media_type: mimeType, data: att.base64 },
+      });
 
-[FIGURE — décomposition de 7875 et 975 avec PGCD et PPCM]
-\`\`\`arith-table
-{
-  "kind": "prime-factorization",
-  "numbers": [
-    {
-      "value": 7875,
-      "steps": [
-        {"dividend": 7875, "prime": 3},
-        {"dividend": 2625, "prime": 3},
-        {"dividend": 875,  "prime": 5},
-        {"dividend": 175,  "prime": 5},
-        {"dividend": 35,   "prime": 5},
-        {"dividend": 7,    "prime": 7}
-      ],
-      "result": "3²×5³×7"
-    },
-    {
-      "value": 975,
-      "steps": [
-        {"dividend": 975, "prime": 5},
-        {"dividend": 195, "prime": 5},
-        {"dividend": 39,  "prime": 3},
-        {"dividend": 13,  "prime": 13}
-      ],
-      "result": "3×5²×13"
+    } else if (att.type === 'document') {
+      let mimeType = att.mimeType.toLowerCase();
+      if (['application/octet-stream', 'application/x-unknown', ''].includes(mimeType)) {
+        if (att.name?.toLowerCase().endsWith('.pdf')) {
+          mimeType = 'application/pdf';
+        } else {
+          console.warn('[chat] Document ignoré — mimeType non déterminable :', att.name);
+          continue;
+        }
+      }
+      if (!ACCEPTED_DOC_TYPES.has(mimeType)) {
+        console.warn('[chat] Document ignoré — mimeType non supporté :', mimeType);
+        continue;
+      }
+      blocks.push({
+        type: 'document',
+        source: { type: 'base64', media_type: mimeType, data: att.base64 },
+      });
     }
-  ],
-  "pgcd": "3×5² = 75",
-  "ppcm": "3²×5³×7×13 = 102375"
+  }
+
+  if (blocks.length === 0) return message;
+  if (message?.trim().length > 0) blocks.push({ type: 'text', text: message });
+  return blocks;
 }
-\`\`\`
 
-\\(\\text{PGCD}(7875; 975) = 3 \\times 5^2 = 75\\)
-\\(\\text{PPCM}(7875; 975) = 3^2 \\times 5^3 \\times 7 \\times 13 = 102375\\)
+// ── Détection de la nécessité d'une recherche web ────────────────────────────
 
-────────────────────────────────────────────────
-IV – FORMULE DU BINÔME DE NEWTON
-────────────────────────────────────────────────
+const NO_SEARCH_PATTERNS = [
+  /^(bonjour|salut|hello|hi|hey|bonsoir|coucou)\b/i,
+  /^(merci|thanks|thank you)\b/i,
+  /^\d[\d\s+\-*/^().,]*$/,
+  /^(résume|reformule|traduis|corrige|améliore)\s/i,
+  /^(continue|vas-y|ok|oui|non|d'accord)\b/i,
+  /^(quel est ton nom|qui es-tu|tu es qui|what are you)\b/i,
+];
 
-\\[(a+b)^n = \\sum_{k=0}^{n} C_n^k\\, a^{n-k}\\, b^k = C_n^0 a^n + C_n^1 a^{n-1}b + \\cdots + C_n^n b^n\\]
+function needsSearch(query) {
+  const q = query.trim();
+  if (q.length < 8) return false;
+  return !NO_SEARCH_PATTERNS.some(re => re.test(q));
+}
 
-Avec : \\(C_n^k = \\dfrac{n!}{(n-k)! \\times k!}\\)
+// ── Helpers affichage recherche ───────────────────────────────────────────────
 
-════════════════════════════════════════════
-EXERCICE TYPE — DÉTERMINER TOUS LES COUPLES (a;b)
-════════════════════════════════════════════
+function getAgentLabel(agent) {
+  switch (agent) {
+    case 'image':     return 'images';
+    case 'academic':  return 'articles académiques';
+    case 'reddit':    return 'discussions Reddit';
+    case 'wikipedia': return 'articles Wikipedia';
+    default:          return 'sources web';
+  }
+}
 
-Exemple — Trouver tous les couples \\((a;b) \\in \\mathbb{N}^2\\) tels que \\(a \\wedge b = 7\\) et \\(a \\vee b = 84\\) :
+function buildSearchSummary(searchResult) {
+  if (!searchResult || searchResult.sources.length === 0) return null;
+  const { agent, sources } = searchResult;
+  const count  = sources.length;
+  const label  = getAgentLabel(agent);
+  const titles = sources
+    .slice(0, 3)
+    .map(s => `• ${s.title.slice(0, 60)}${s.title.length > 60 ? '…' : ''}`)
+    .join('\n');
+  return `J'ai trouvé ${count} ${label} :\n${titles}${count > 3 ? `\n• … et ${count - 3} de plus` : ''}\n\nJe synthétise maintenant…`;
+}
 
-D'après P4 : \\(a = 7a_1\\), \\(b = 7b_1\\), \\(a_1 \\wedge b_1 = 1\\).
-\\[7a_1 \\vee 7b_1 = 7(a_1 \\vee b_1) = 84 \\Rightarrow a_1 b_1 = 12\\]
-\\(D_{12} = \\{1; 2; 3; 4; 6; 12\\}\\).
-— \\(a_1 = 1\\), \\(b_1 = 12\\) : \\(1 \\wedge 12 = 1\\) ✓ → \\(a = 7\\), \\(b = 84\\).
-— \\(a_1 = 2\\), \\(b_1 = 6\\) : \\(2 \\wedge 6 = 2 \\neq 1\\) ✗
-— \\(a_1 = 3\\), \\(b_1 = 4\\) : \\(3 \\wedge 4 = 1\\) ✓ → \\(a = 21\\), \\(b = 28\\).
+// ── Parser les étapes de thinking partiel ────────────────────────────────────
 
-\\[S = \\{(7; 84); (84; 7); (21; 28); (28; 21)\\}\\]
+function parseStepsFromPartial(partial) {
+  const completions = [partial, partial + ']}', partial + '"]}', partial + '"}]}'];
+  for (const attempt of completions) {
+    try {
+      const parsed = JSON.parse(attempt.trim());
+      if (parsed?.steps && Array.isArray(parsed.steps) && parsed.steps.length > 0) {
+        return parsed.steps.map(s => ({ title: String(s.title ?? '') }));
+      }
+    } catch {}
+  }
+  const matches = [...partial.matchAll(/"title"\s*:\s*"([^"\\]+)"/g)];
+  if (matches.length > 0) return matches.map(m => ({ title: m[1] }));
+  const lines = partial.split('\n')
+    .map(l => l.replace(/^[-*•#>\d.)\s]+/, '').trim())
+    .filter(l => l.length > 4);
+  if (lines.length > 0) return lines.slice(0, 4).map(l => ({ title: l.slice(0, 80) }));
+  return [];
+}
 
-══════════════════════════════════════════════════
-DÉTECTION — toujours en premier dans chaque réponse
-══════════════════════════════════════════════════
+// ── Nettoyage du contenu affiché (retire les balises <thinking>) ──────────────
+//
+// FIX : gère désormais 3 cas :
+//  1. <thinking>...</thinking> complet -> retiré
+//  2. <thinking> ouvert sans fermeture (message coupé en plein streaming)
+//     -> tout ce qui suit <thinking> est retiré
+//  3. JSON orphelin de type {"steps":[...]} (sans même la balise <thinking>,
+//     ex: contenu sauvegardé après un crash) -> retiré aussi
+//
+function stripThinking(content) {
+  if (typeof content !== 'string') return content;
 
-🔍 Type détecté : [description PRÉCISE et UNIQUE à CET exercice]
-📌 Méthode : [chapitre + numéro exact]
+  let cleaned = content
+    // Cas 1 : thinking fermé
+    .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
+    // Cas 2 : thinking ouvert non fermé jusqu'à la fin du texte
+    .replace(/<thinking>[\s\S]*$/g, '');
 
-| Situation                                              | Méthode                              |
-| Trouver \\(\\text{PPCM}(a;b)\\)                        | I — PPCM                             |
-| Trouver \\(\\text{PGCD}(a;b)\\) — petits nombres       | II-1° INTERSECTION DIVISEURS         |
-| Trouver \\(\\text{PGCD}(a;b)\\) — grands nombres       | II-3° ALGORITHME D'EUCLIDE           |
-| \\(a\\) et \\(b\\) premiers entre eux + coefficients   | II — BÉZOUT                          |
-| \\(a \\mid bc\\) et \\(a \\wedge b = 1\\)              | II — GAUSS                           |
-| Décomposer en facteurs premiers                        | III — DÉCOMPOSITION                  |
-| PGCD/PPCM par décomposition                            | III — APPLICATION DÉCOMPOSITION      |
-| Trouver tous les couples avec PGCD et PPCM donnés      | II + P4 — COUPLES (a;b)              |
-| \\((a+b)^n\\) ou \\(C_n^k\\)                           | IV — BINÔME DE NEWTON                |
+  // Cas 3 : JSON "steps" orphelin (avec ou sans accolade finale)
+  cleaned = cleaned
+    .replace(/\{?\s*"steps"\s*:\s*\[[\s\S]*?\]\s*\}?/g, '')
+    .replace(/^\s*\{\s*"steps"\s*:[\s\S]*?\}?\s*$/gm, '');
 
-══════════════════════════════════════════════════
-ORDRE DES ÉTAPES — STRICTEMENT RESPECTÉ
-══════════════════════════════════════════════════
+  return cleaned.trimStart();
+}
 
-II-3° ALGORITHME D'EUCLIDE :
-  a. Poser chaque division LaTeX  [une ligne par division]
-  b. IMMÉDIATEMENT après les divisions, émettre OBLIGATOIREMENT le bloc
-     arith-table "euclid-algorithm" avec tous les steps — JAMAIS un tableau
-     Markdown, JAMAIS un tableau texte, JAMAIS un tableau avec
-     | ai | bi | ri | ou toute variante avec des pipes. Le seul format autorisé est :
-     \`\`\`arith-table
-     { "kind": "euclid-algorithm", ... }
-     \`\`\`
-  c. PGCD = dernier reste non nul  [ligne seule]
+// ─────────────────────────────────────────────────────────────────────────────
+// Route principale
+// ─────────────────────────────────────────────────────────────────────────────
 
-BÉZOUT — REMONTÉE :
-  a. Poser les divisions de l'algorithme d'Euclide  [une ligne par division]
-  b. IMMÉDIATEMENT après les divisions, émettre OBLIGATOIREMENT le bloc
-     arith-table "bezout-table" — JAMAIS un tableau Markdown, JAMAIS un
-     tableau texte, JAMAIS un tableau avec | dividende | diviseur | quotient | reste |
-     ou toute variante avec des pipes. Le seul format autorisé est :
-     \`\`\`arith-table
-     { "kind": "bezout-table", ... }
-     \`\`\`
-  c. Exprimer chaque reste en remontant  [une ligne par étape]
-  d. Identifier \\(k\\) et \\(\\ell\\)  [encadrés]
-  e. Vérifier : \\(ak + b\\ell = 1\\) ✓
+router.post('/', async (req, res) => {
+  const {
+    message,
+    history      = [],
+    model        = 'opus',
+    deepResearch = false,
+    max_tokens,
+    temperature,
+    attachments  = [],
+  } = req.body;
 
-III — DÉCOMPOSITION :
-  a. Diviser successivement  [une division par ligne]
-  b. IMMÉDIATEMENT après les divisions, émettre OBLIGATOIREMENT le bloc
-     arith-table "prime-factorization" avec pgcd et ppcm si demandés —
-     JAMAIS un tableau Markdown, JAMAIS un tableau texte, JAMAIS un tableau
-     avec | nombre | diviseur | ou toute variante avec des pipes.
-     Le seul format autorisé est :
-     \`\`\`arith-table
-     { "kind": "prime-factorization", ... }
-     \`\`\`
-  c. PGCD : facteurs communs avec exposants minimaux  [ligne seule]
-  d. PPCM : tous facteurs avec exposants maximaux  [ligne seule]
+  if (!message || typeof message !== 'string') {
+    return res.status(400).json({ error: 'message requis' });
+  }
 
-COUPLES (a;b) :
-  a. Poser \\(a = \\delta a_1\\), \\(b = \\delta b_1\\), \\(a_1 \\wedge b_1 = 1\\)
-  b. Calculer \\(a_1 b_1 = \\mu / \\delta\\)
-  c. Tester les diviseurs  [un cas par ligne]
-  d. \\(S = \\{\\ldots\\}\\) avec couples symétriques
+  if (attachments.length > 0) {
+    console.log(
+      `[chat] ${attachments.length} pièce(s) jointe(s) :`,
+      attachments.map(a =>
+        `${a.name} (${a.type}, ${a.mimeType}, ${
+          a.base64 ? Math.round(a.base64.length / 1024) + ' Ko' : 'ABSENT'
+        })`
+      ).join(', ')
+    );
+  }
 
-══════════════════════════════════════════════════
-⛔ INTERDICTIONS ABSOLUES
-══════════════════════════════════════════════════
+  // ── SSE setup ─────────────────────────────────────────────────────────────
+  res.setHeader('Content-Type',      'text/event-stream');
+  res.setHeader('Cache-Control',     'no-cache');
+  res.setHeader('Connection',        'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
 
-❌ JAMAIS s'arrêter à un reste nul sans identifier le bon PGCD
-❌ JAMAIS confondre PGCD (exposants min) et PPCM (exposants max)
-❌ JAMAIS oublier les couples symétriques \\((b;a)\\) dans S
-❌ JAMAIS deux calculs sur la même ligne
-❌ JAMAIS un tableau Markdown à la place d'un bloc arith-table
-❌ JAMAIS omettre le bloc arith-table pour Euclide, Bézout ou décomposition
-❌ JAMAIS une description générique dans 🔍 Type détecté
-❌ JAMAIS un tableau | ai | bi | ri | pour l'algorithme d'Euclide
-❌ JAMAIS un tableau | dividende | diviseur | quotient | reste | pour Bézout
-❌ JAMAIS un tableau | nombre | diviseur | pour une décomposition en facteurs premiers
-❌ JAMAIS remplacer arith-table par un tableau Markdown sous aucun prétexte,
-   quelle que soit la situation, même « pour aller plus vite » ou « pour clarifier »
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const done = ()      => { res.write('data: [DONE]\n\n'); res.end(); };
 
-══════════════════════════════════════════════════
-✅ OBLIGATIONS ABSOLUES
-══════════════════════════════════════════════════
+  // ── Helper : construction des messages history ────────────────────────────
+  function buildHistory() {
+    return (history ?? [])
+      .filter(m => m.role && m.content)
+      .map(m => ({
+        role:    m.role,
+        content: m.role === 'assistant' ? stripThinking(m.content) : m.content,
+      }))
+      .filter(m => typeof m.content === 'string' && m.content.trim().length > 0);
+  }
 
-✓ 🔍 Type détecté contient les données concrètes de l'exercice
-✓ 📌 Méthode cite le chapitre et le numéro exact
-✓ Définition ou propriété citée avant toute résolution
-✓ Bloc arith-table "euclid-algorithm" émis pour TOUT algorithme d'Euclide
-✓ Bloc arith-table "bezout-table" émis pour TOUTE identité de Bézout
-✓ Bloc arith-table "prime-factorization" émis pour TOUTE décomposition
-✓ Les steps des blocs correspondent EXACTEMENT aux divisions LaTeX
-✓ \\(S = \\{\\ldots\\}\\) en conclusion FINALE — rien après
+  try {
 
-══════════════════════════════════════════════════
-☐ LISTE DE CONTRÔLE — À VÉRIFIER AVANT ENVOI
-══════════════════════════════════════════════════
+    // ── 1. Pipeline code (deep research) ─────────────────────────────────────
+    if (deepResearch && needsCodePipeline(message)) {
+      await runCodePipeline(message, (agentSteps) => {
+        send({ type: 'pipeline', steps: agentSteps });
+      }).then(result => {
+        send({ type: 'codeResult', result });
+        done();
+      });
+      return;
+    }
 
-☐ La réponse contient-elle un bloc \`\`\`arith-table … \`\`\` pour chaque
-  algorithme d'Euclide, remontée de Bézout, et décomposition en facteurs
-  premiers ? → Si non : CORRIGER avant d'envoyer.
-☐ Aucun tableau Markdown | … | n'est présent dans la réponse.
-☐ Aucun tableau texte aligné avec des espaces n'est présent dans la réponse.
-☐ Chaque bloc arith-table vient IMMÉDIATEMENT après les lignes LaTeX correspondantes,
-  sans rien entre les deux.
-☐ Le champ "steps" de chaque bloc liste exactement les mêmes valeurs
-  que les lignes LaTeX — ni plus, ni moins.
-☐ Les couples symétriques \\((b;a)\\) sont inclus dans \\(S\\).
-`;
+    // ── 2. Agent loop (execute_code / edit_file) ──────────────────────────────
+    if (!deepResearch && needsAgentLoop(message)) {
+      const systemPrompt = getSystemPrompt(message, undefined);
+      const userContent  = buildUserContent(message, attachments);
 
-module.exports = { ARITH_PGCD_PPCM_PROMPT };
+      const messages = [
+        { role: 'system', content: systemPrompt },
+        ...buildHistory(),
+        { role: 'user', content: userContent },
+      ];
+
+      await runAgentLoop({
+        res,
+        messages,
+        model:       model ?? 'sonnet',
+        max_tokens:  max_tokens  ?? 8192,
+        temperature: temperature ?? 0.2,
+      });
+      return;
+    }
+
+    // ── 3. Recherche web ──────────────────────────────────────────────────────
+    let systemContext = '';
+    let sources       = [];
+    const shouldSearch = message.trim().length >= 8 && needsSearch(message);
+
+    if (shouldSearch) {
+      send({ type: 'searching', status: 'loading', label: 'Recherche en cours…', icon: 'globe' });
+
+      try {
+        const searchResult = await runSearchAgent(message);
+
+        if (searchResult?.sources?.length > 0 || searchResult?.images?.length > 0) {
+          sources       = searchResult.sources;
+          systemContext = searchResult.contextBlock;
+
+          if (sources.length > 0) {
+            send({ type: 'sources', sources, agent: searchResult.agent });
+          }
+          if (searchResult.images?.length > 0) {
+            send({ type: 'images', images: searchResult.images, intent: searchResult.imageIntent ?? 'none' });
+          }
+
+          const summary = buildSearchSummary(searchResult);
+          send({ type: 'searching', status: 'done', label: summary, icon: 'globe', count: sources.length, agent: searchResult.agent });
+
+        } else {
+          send({ type: 'searching', status: 'done', label: 'Aucun résultat — je réponds avec mes connaissances.', icon: 'globe' });
+        }
+
+      } catch (err) {
+        console.warn('[chat] Recherche échouée :', err.message);
+        send({ type: 'searching', status: 'error', label: 'Recherche indisponible — réponse directe.', icon: 'globe' });
+      }
+    }
+
+    // ── 4. Construction des messages ──────────────────────────────────────────
+    const systemPrompt = getSystemPrompt(message, systemContext || undefined);
+    const userContent  = buildUserContent(message, attachments);
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...buildHistory(),
+      { role: 'user', content: userContent },
+    ];
+
+    // ── 5. Appel LLM (prefill arith-table géré automatiquement dans openrouter.js)
+    let streamedContent = '';
+
+    const result = await openRouterFetch({
+      model:       model ?? 'opus',
+      max_tokens:  max_tokens  ?? 8192,
+      temperature: temperature ?? 0.7,
+      messages,
+
+      onChunk: (fullContent) => {
+        streamedContent = fullContent;
+
+        // Thinking steps
+        const thinkMatch = streamedContent.match(/<thinking>([\s\S]*)/);
+        if (thinkMatch) {
+          const partial = thinkMatch[1];
+          const steps   = parseStepsFromPartial(partial);
+          if (steps.length > 0) {
+            const thinkingComplete = streamedContent.includes('</thinking>');
+            send({
+              type:  'thinkingSteps',
+              steps: steps.map((s, i) => ({
+                label: s.title,
+                icon:  'think',
+                done:  thinkingComplete || i < steps.length - 1,
+              })),
+            });
+          }
+        }
+
+        // N'envoyer le contenu affiché qu'une fois le thinking fermé
+        if (!streamedContent.includes('</thinking>')) return;
+
+        const displayContent = stripThinking(streamedContent);
+        if (!displayContent) return;
+
+        send({ type: 'chunk', content: displayContent });
+      },
+    });
+
+    // Flush final garanti
+    const finalDisplay = stripThinking(streamedContent);
+    if (finalDisplay) send({ type: 'chunk', content: finalDisplay });
+
+    send({ type: 'done', modelUsed: result.modelUsed });
+    done();
+
+  } catch (err) {
+    console.error('[/api/chat] Erreur :', err?.message ?? err);
+    send({ type: 'error', message: err?.message ?? 'Erreur interne du serveur' });
+    done();
+  }
+});
+
+module.exports = router;
