@@ -176,7 +176,17 @@ ORDRE DES ÉTAPES — STRICTEMENT RESPECTÉ
 VI-a° ÉQUATION 1er DEGRÉ (méthode tableau) :
   a. Énoncer \\(n\\) et \\(\\mathbb{Z}/n\\mathbb{Z}\\)  [ligne seule]
   b. Calculer chaque ligne du tableau LaTeX [une ligne par valeur]
-  c. Émettre IMMÉDIATEMENT le bloc arith-table "znz-value-table"
+  c. IMMÉDIATEMENT après les calculs LaTeX, émettre OBLIGATOIREMENT
+     le bloc arith-table "znz-value-table" — FORMAT IMPOSÉ : bloc de code
+     avec le marqueur arith-table, contenant le JSON avec "kind",
+     "modulus", "expression", "xValues", "rows", "finalRow" et "solutions".
+     INTERDIT sous toutes ses formes :
+       • tableau Markdown  | x | 2x | 2x+1 |
+       • tableau texte avec espaces ou tirets
+       • liste à puces récapitulative
+       • tout autre format de substitution
+     Le bloc arith-table est le SEUL format autorisé pour présenter
+     un tableau de valeurs dans ℤ/nℤ.
   d. Conclure : \\(S = \\{\\ldots\\}\\)
 
 VI-a° ÉQUATION 1er DEGRÉ (méthode inverse) :
@@ -193,7 +203,9 @@ VI-b° ÉQUATION 2ND DEGRÉ (anneau intègre) :
 
 VI-b° ÉQUATION 2ND DEGRÉ (anneau non intègre) :
   a. Rappeler que l'anneau est non intègre
-  b. Émettre le bloc arith-table "znz-value-table" avec toutes les valeurs
+  b. IMMÉDIATEMENT, émettre le bloc arith-table "znz-value-table"
+     avec toutes les valeurs — JAMAIS de tableau Markdown à la place,
+     quelle que soit la raison invoquée
   c. \\(S = \\{\\ldots\\}\\)
 
 VI-c° SYSTÈME :
@@ -212,6 +224,10 @@ VI-c° SYSTÈME :
 ❌ JAMAIS sauter la vérification de l'inversibilité de \\(\\dot{a}\\)
 ❌ JAMAIS deux calculs sur la même ligne
 ❌ JAMAIS tableau markdown à la place d'un bloc arith-table
+❌ JAMAIS un tableau | x | ... | pour un tableau de valeurs dans ℤ/nℤ
+❌ JAMAIS un tableau | \\(\\dot{x}\\) | ... | ou toute variante Markdown
+❌ JAMAIS remplacer arith-table par un tableau Markdown sous aucun prétexte,
+   quelle que soit la raison invoquée (lisibilité, simplification, etc.)
 ❌ JAMAIS omettre le bloc arith-table quand la méthode par tableau est utilisée
 ❌ JAMAIS une description générique dans 🔍 Type détecté
 
@@ -225,6 +241,19 @@ VI-c° SYSTÈME :
 ✓ Bloc arith-table "znz-value-table" émis quand méthode tableau utilisée
 ✓ Les "values" du bloc correspondent EXACTEMENT aux calculs LaTeX
 ✓ \\(S = \\{\\ldots\\}\\) en conclusion FINALE — rien après
+
+══════════════════════════════════════════════════
+RAPPEL FINAL — LISTE DE CONTRÔLE AVANT ENVOI
+══════════════════════════════════════════════════
+
+☐ 🔍 Type détecté contient les données concrètes (pas une catégorie générique)
+☐ 📌 Méthode cite le chapitre et le numéro exact
+☐ La propriété ou définition du cours est citée avant la première ligne de calcul
+☐ Chaque calcul est sur sa propre ligne (1 ligne = 1 idée)
+☐ Bloc arith-table émis et cohérent avec les calculs LaTeX
+☐ Aucun tableau Markdown | ... | n'est présent dans la réponse
+☐ Pour anneau non intègre : inversibilité vérifiée avant tout calcul
+☐ \\(S = \\{\\ldots\\}\\) en conclusion FINALE — rien après
 `;
 
 module.exports = { ARITH_EQUATIONS_ZNZ_PROMPT };
