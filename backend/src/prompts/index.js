@@ -59,7 +59,7 @@ function hasFractionExpr(msg) {
     || /\([^)]+\)\s*[\/÷]\s*[a-z0-9]/.test(msg);
 }
 function hasEtudierSigne(msg) {
-  return ['etudier le signe','signe de','etude du signe','signe d'].some(k => msg.includes(k));
+  return ['etudier le signe','signe de','etude du signe',"signe d'"].some(k => msg.includes(k));
 }
 function hasTrinomeExpr(msg) {
   return /x\s*\^?\s*2\b/.test(msg) || msg.includes('x²') || msg.includes('x^2');
