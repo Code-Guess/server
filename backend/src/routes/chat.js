@@ -50,11 +50,11 @@ function resolveAttachmentType(att) {
   if (mime === 'image/jpg') mime = 'image/jpeg';
   if (['application/octet-stream', 'application/x-unknown', ''].includes(mime)) {
     const name = att.name?.toLowerCase() ?? '';
-    if (name.endsWith('.pdf'))                          mime = 'application/pdf';
+    if (name.endsWith('.pdf'))                                mime = 'application/pdf';
     else if (name.endsWith('.jpg') || name.endsWith('.jpeg')) mime = 'image/jpeg';
-    else if (name.endsWith('.png'))                     mime = 'image/png';
-    else if (name.endsWith('.gif'))                     mime = 'image/gif';
-    else if (name.endsWith('.webp'))                    mime = 'image/webp';
+    else if (name.endsWith('.png'))                           mime = 'image/png';
+    else if (name.endsWith('.gif'))                           mime = 'image/gif';
+    else if (name.endsWith('.webp'))                          mime = 'image/webp';
     else return null;
   }
   if (ACCEPTED_IMAGE_TYPES.has(mime)) return { resolvedType: 'image',    resolvedMime: mime };
@@ -228,11 +228,17 @@ router.post('/', async (req, res) => {
     const messages = [{ role: 'system', content: systemPrompt }, ...buildHistory(), { role: 'user', content: userContent }];
 
     // ── 5. Appel LLM ──────────────────────────────────────────────────────────
-    // FIX PRINCIPAL : openrouter.js envoie des DELTAS via onChunk/onReasoningChunk.
-    // On accumule ici pour avoir le contenu complet à chaque callback.
-    let accContent          = '';  // cumul des deltas content
-    let accReasoning        = '';  // cumul des deltas reasoning
-    let lastSentThinkingLen = 0;   // pour envoyer seulement le nouveau delta thinking
+    //
+    // STRATÉGIE : le backend envoie au client des chunks de type "replace"
+    // contenant le CONTENU VISIBLE COMPLET à chaque fois (pas un delta).
+    // Le client remplace simplement le texte entier — plus de duplication.
+    // Le thinking est streamé séparément via { type: 'thinking', content: delta }.
+    //
+    let accContent          = '';   // cumul des deltas content
+    let accReasoning        = '';   // cumul des deltas reasoning
+    let lastSentThinkingLen = 0;    // curseur pour envoyer seulement le nouveau morceau thinking
+    let thinkingStarted     = false;
+    let thinkingDone        = false;
 
     const result = await openRouterFetch({
       model:       resolvedModel,
@@ -240,20 +246,25 @@ router.post('/', async (req, res) => {
       temperature: safeTemperature,
       messages,
 
-      // onChunk reçoit un DELTA (nouveau morceau seulement) — on accumule
+      // onChunk reçoit le DELTA depuis openrouter.js — on accumule ici
       onChunk: (delta) => {
         accContent += delta;
 
-        const hasOpen  = accContent.includes('<thinking>');
-        const hasClose = accContent.includes('</thinking>');
+        const openIdx  = accContent.indexOf('<thinking>');
+        const closeIdx = accContent.indexOf('</thinking>');
+        const hasOpen  = openIdx  !== -1;
+        const hasClose = closeIdx !== -1;
 
-        // ── Thinking en cours (tag ouvert, non fermé) ──────────────────────
+        // ── Thinking en cours (ouvert, pas encore fermé) ───────────────────
         if (hasOpen && !hasClose) {
-          const before = accContent.slice(0, accContent.indexOf('<thinking>')).trimEnd();
-          if (before) send({ type: 'chunk', content: before });
+          thinkingStarted = true;
 
-          // Envoyer seulement le nouveau morceau du thinking
-          const thinkingFull  = accContent.split('<thinking>')[1] ?? '';
+          // Envoyer le contenu AVANT <thinking> une seule fois (replace)
+          const before = accContent.slice(0, openIdx).trimEnd();
+          if (before) send({ type: 'replace', content: before });
+
+          // Streamer seulement le NOUVEAU morceau du thinking
+          const thinkingFull  = accContent.slice(openIdx + '<thinking>'.length);
           const thinkingDelta = thinkingFull.slice(lastSentThinkingLen);
           if (thinkingDelta.length > 0) {
             send({ type: 'thinking', content: thinkingDelta });
@@ -263,27 +274,32 @@ router.post('/', async (req, res) => {
           const steps = parseStepsFromPartial(thinkingFull);
           if (steps.length > 0)
             send({ type: 'thinkingSteps', steps: steps.map(s => ({ label: s.title, icon: 'think', done: false })) });
-          return;
+
+          return; // ne pas envoyer de contenu visible pendant le thinking
         }
 
         // ── Thinking fermé ─────────────────────────────────────────────────
-        if (hasOpen && hasClose) {
-          const thinkingFull  = accContent.split('<thinking>')[1]?.split('</thinking>')[0] ?? '';
+        if (hasOpen && hasClose && !thinkingDone) {
+          thinkingDone = true;
+
+          const thinkingFull  = accContent.slice(openIdx + '<thinking>'.length, closeIdx);
           const thinkingDelta = thinkingFull.slice(lastSentThinkingLen);
           if (thinkingDelta.length > 0) {
             send({ type: 'thinking', content: thinkingDelta });
             lastSentThinkingLen = thinkingFull.length;
           }
+
           const steps = parseStepsFromPartial(thinkingFull);
           if (steps.length > 0)
             send({ type: 'thinkingSteps', steps: steps.map(s => ({ label: s.title, icon: 'think', done: true })) });
         }
 
+        // Contenu visible (tout sauf thinking) — envoyé comme REPLACE
         const displayContent = stripThinking(accContent);
-        if (displayContent) send({ type: 'chunk', content: displayContent });
+        if (displayContent) send({ type: 'replace', content: displayContent });
       },
 
-      // onReasoningChunk reçoit un DELTA de reasoning — on streame en thinking
+      // onReasoningChunk reçoit le DELTA de reasoning — streamé en thinking
       onReasoningChunk: (delta) => {
         accReasoning += delta;
         send({ type: 'thinking', content: delta });
@@ -291,13 +307,13 @@ router.post('/', async (req, res) => {
     });
 
     // ── Flush final ────────────────────────────────────────────────────────────
-    // Fallback : si tout était dans reasoning (modèles owl-alpha), l'utiliser comme contenu
+    // Fallback : si tout était dans reasoning (modèles owl-alpha)
     if (!accContent.trim() && accReasoning.trim()) {
       accContent = accReasoning;
     }
 
     const finalDisplay = stripThinking(accContent);
-    if (finalDisplay) send({ type: 'chunk', content: finalDisplay });
+    if (finalDisplay) send({ type: 'replace', content: finalDisplay });
 
     send({ type: 'done', modelUsed: result.modelUsed });
     done();
