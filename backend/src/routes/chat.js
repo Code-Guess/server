@@ -485,6 +485,21 @@ router.post('/', async (req, res) => {
       },
     });
 
+    // FIX: certains modèles placent TOUTE leur réponse à l'intérieur de
+    // <thinking>...</thinking> sans rien après. Dans ce cas, stripThinking
+    // retire le bloc entier → displayContent vide → rien n'est jamais
+    // envoyé → "Réponse vide reçue du serveur" côté client.
+    // Fallback : si aucun chunk n'a été envoyé, on retire seulement les
+    // BALISES <thinking>/</thinking> (pas leur contenu) et on envoie le
+    // résultat comme contenu final.
+    if (sentDisplayLength === 0) {
+      const fallback = streamedContent.replace(/<\/?thinking>/gi, '').trim();
+      if (fallback) {
+        send({ type: 'chunk', content: fallback });
+        sentDisplayLength = fallback.length;
+      }
+    }
+
     send({ type: 'done', modelUsed: result.modelUsed });
     done();
 
