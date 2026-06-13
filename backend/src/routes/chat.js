@@ -196,68 +196,32 @@ function buildSearchSummary(searchResult) {
   return `J'ai trouvé ${count} ${label} :\n${titles}${count > 3 ? `\n• … et ${count - 3} de plus` : ''}\n\nJe synthétise maintenant…`;
 }
 
-// ── Parser les étapes de thinking partiel ────────────────────────────────────
+// ── Nettoyage défensif du contenu affiché ────────────────────────────────────
+// FIX MAJEUR : THINKING_FORMAT a été retiré du system prompt (voir base.js).
+// Le modèle ne devrait donc plus émettre de balises <thinking> dans son
+// `content` — le raisonnement natif passe désormais par `delta.reasoning`
+// (voir openrouter.js / onReasoningChunk plus bas).
+// Cette fonction reste comme filet de sécurité défensif, au cas où le
+// modèle émettrait malgré tout des fragments <thinking>, même malformés
+// (ex: "<th<thinking>", "<thinking�", balise jamais fermée, etc.).
 
-function parseStepsFromPartial(partial) {
-  const completions = [partial, partial + ']}', partial + '"]}', partial + '"}]}'];
-  for (const attempt of completions) {
-    try {
-      const parsed = JSON.parse(attempt.trim());
-      if (parsed?.steps && Array.isArray(parsed.steps) && parsed.steps.length > 0) {
-        return parsed.steps.map(s => ({ title: String(s.title ?? '') }));
-      }
-    } catch {}
-  }
-
-  const matches = [...partial.matchAll(/"title"\s*:\s*"([^"\\]+)"/g)];
-  if (matches.length > 0) return matches.map(m => ({ title: m[1] }));
-
-  return [];
-}
-
-// ── Nettoyage du contenu affiché (retire les balises <thinking>) ──────────────
-// FIX: robuste sur tags partiels, insensible à la casse, gère aussi </thinking>
-// FIX 2: tolère les balises malformées type "<th<thinking>" générées par
-// certains modèles lorsqu'un prefill se chevauche avec le début du flux.
-
-function stripThinking(content) {
+function stripThinkingArtifacts(content) {
   if (!content) return content;
 
   // Normaliser les balises ouvrantes malformées (ex: "<th<thinking>" → "<thinking>")
-  content = content.replace(/<[a-zA-Z]{0,9}(<thinking>)/gi, '$1');
+  content = content.replace(/<[a-zA-Z]{0,12}(<thinking[^>]*>?)/gi, '$1');
 
-  // Tags complets (toutes variantes)
-  if (/<\/thinking>/i.test(content)) {
-    return content
-      .replace(/<thinking>[\s\S]*?<\/thinking>\s*/gi, '')
-      .trimStart();
-  }
+  // Bloc complet <thinking ...> ... </thinking>
+  content = content.replace(/<thinking[^>]*>[\s\S]*?<\/thinking>\s*/gi, '');
 
-  // Tag ouvert non fermé → couper à partir de là
-  const idx = content.search(/<thinking>/i);
-  if (idx !== -1) {
+  // Balise ouvrante non fermée (avec ou sans '>', avec ou sans caractère
+  // mal encodé juste après, ex: "<thinking�") → couper à partir de là
+  const idx = content.search(/<thinking[^>]*>?/i);
+  if (idx !== -1 && !/<\/thinking>/i.test(content)) {
     return content.slice(0, idx).trimEnd();
   }
 
-  return content;
-}
-
-// ── Nettoyage du JSON des "steps" (utilisé en fallback de reasoning) ─────────
-// FIX : quand le modèle place toute sa réponse dans `delta.reasoning` (cas
-// owl-alpha sur messages simples), ce texte contient souvent encore le bloc
-// JSON `{"steps":[...]}` et/ou les balises <thinking>. On retire les deux
-// avant de l'utiliser comme contenu affiché de secours.
-
-function stripStepsJson(content) {
-  if (!content) return content;
-  let cleaned = stripThinking(content);
-
-  // Retire un éventuel bloc JSON {"steps": [...]} en début de texte
-  cleaned = cleaned.replace(/^\s*\{?\s*"steps"\s*:\s*\[[\s\S]*?\]\s*\}?\s*/i, '');
-  // Retire un objet JSON complet { ... "steps" ... } isolé sur tout le texte
-  cleaned = cleaned.replace(/^\s*\{[\s\S]*?"steps"[\s\S]*?\]\s*\}\s*/i, '');
-
-  return cleaned.trim();
+  return content.trim();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -339,7 +303,7 @@ router.post('/', async (req, res) => {
       )
       .map(m => ({
         role:    m.role,
-        content: m.role === 'assistant' ? stripThinking(m.content) : m.content,
+        content: m.role === 'assistant' ? stripThinkingArtifacts(m.content) : m.content,
       }))
       .filter(m => m.content.trim().length > 0);
   }
@@ -430,25 +394,26 @@ router.post('/', async (req, res) => {
     // ── 5. Appel LLM ──────────────────────────────────────────────────────────
     let streamedContent = '';
 
-    // FIX: flag pour n'envoyer le contenu "avant <thinking>" qu'une seule fois
-    // L'ancien code renvoyait `before` à chaque chunk → duplication côté client
-    let thinkingStartSent = false;
-
     // FIX MAJEUR: on envoie désormais des DELTAS au client (pas le total
-    // accumulé). L'ancien code envoyait `stripThinking(streamedContent)`
-    // (= tout le texte affiché depuis le début) à CHAQUE chunk, et le client
-    // fait `result.content += event.content` → accumulation d'accumulations,
-    // donc répétition exponentielle du texte ("Salut ! Je suis NerosiaSalut !
-    // Je suis Nerosia. Comment puis-..."). On ne renvoie maintenant que la
-    // portion nouvelle de `displayContent` par rapport à ce qui a déjà été
-    // envoyé (sentDisplayLength).
+    // accumulé). L'ancien code envoyait le total accumulé à CHAQUE chunk,
+    // et le client fait `result.content += event.content` → accumulation
+    // d'accumulations → répétition exponentielle du texte. On ne renvoie
+    // maintenant que la portion nouvelle de `displayContent` par rapport à
+    // ce qui a déjà été envoyé (sentDisplayLength).
     let sentDisplayLength = 0;
 
-    // FIX : certains modèles (owl-alpha) envoient pour les messages simples
-    // TOUT leur texte via `delta.reasoning`, jamais via `delta.content`.
-    // On accumule ce texte séparément pour pouvoir s'en servir en dernier
-    // recours si `streamedContent` (content) reste vide.
-    let reasoningContent = '';
+    // FIX : THINKING_FORMAT retiré du system prompt (voir base.js). Le
+    // raisonnement du modèle arrive maintenant via `delta.reasoning`
+    // (canal natif d'owl-alpha), capté ici dans `reasoningContent`.
+    // - On s'en sert pour afficher une étape "Réflexion en cours…" pendant
+    //   que le modèle réfléchit, puis "Rédaction de la réponse" dès que le
+    //   vrai contenu commence à arriver.
+    // - On s'en sert aussi en dernier recours si `streamedContent` reste
+    //   totalement vide (cas des messages très simples comme "Salut" où le
+    //   modèle met parfois toute sa réponse dans `reasoning`).
+    let reasoningContent      = '';
+    let reasoningStepSent     = false;
+    let writingStepSent       = false;
 
     const result = await openRouterFetch({
       model:       resolvedModel,
@@ -458,83 +423,45 @@ router.post('/', async (req, res) => {
 
       onReasoningChunk: (chunk) => {
         reasoningContent += chunk;
+        if (!reasoningStepSent) {
+          reasoningStepSent = true;
+          send({
+            type:  'thinkingSteps',
+            steps: [{ label: 'Réflexion en cours…', icon: 'think', done: false }],
+          });
+        }
       },
 
       onChunk: (chunk) => {
         streamedContent += chunk;
 
-        const hasOpen  = /<thinking>/i.test(streamedContent);
-        const hasClose = /<\/thinking>/i.test(streamedContent);
-
-        // Thinking en cours (tag ouvert, pas encore fermé)
-        if (hasOpen && !hasClose) {
-          if (!thinkingStartSent) {
-            // FIX: envoyer "before" une seule fois, pas à chaque chunk
-            thinkingStartSent = true;
-            const openIdx = streamedContent.search(/<thinking>/i);
-            const before  = streamedContent.slice(0, openIdx).trimEnd();
-            if (before) {
-              send({ type: 'chunk', content: before });
-              sentDisplayLength = before.length;
-            }
-          }
-
-          const partial = streamedContent.split(/<thinking>/i)[1] ?? '';
-          const steps   = parseStepsFromPartial(partial);
-          if (steps.length > 0) {
-            send({
-              type:  'thinkingSteps',
-              steps: steps.map(s => ({ label: s.title, icon: 'think', done: false })),
-            });
-          }
-          return;
-        }
-
-        // Thinking fermé : envoyer les étapes finales
-        if (hasOpen && hasClose) {
-          const parts   = streamedContent.split(/<thinking>/i);
-          const partial = (parts[1] ?? '').split(/<\/thinking>/i)[0] ?? '';
-          const steps   = parseStepsFromPartial(partial);
-          if (steps.length > 0) {
-            send({
-              type:  'thinkingSteps',
-              steps: steps.map(s => ({ label: s.title, icon: 'think', done: true })),
-            });
-          }
-        }
-
-        // Envoyer uniquement le delta du contenu nettoyé (sans balises thinking)
-        const displayContent = stripThinking(streamedContent);
+        // Envoyer uniquement le delta du contenu nettoyé (filet de sécurité
+        // défensif contre d'éventuelles balises <thinking> résiduelles)
+        const displayContent = stripThinkingArtifacts(streamedContent);
         if (displayContent.length > sentDisplayLength) {
           const delta = displayContent.slice(sentDisplayLength);
-          if (delta) send({ type: 'chunk', content: delta });
-          sentDisplayLength = displayContent.length;
+          if (delta) {
+            if (!writingStepSent) {
+              writingStepSent = true;
+              send({
+                type:  'thinkingSteps',
+                steps: [{ label: 'Rédaction de la réponse', icon: 'done', done: true }],
+              });
+            }
+            send({ type: 'chunk', content: delta });
+            sentDisplayLength = displayContent.length;
+          }
         }
       },
     });
 
-    // FIX 1 : certains modèles placent TOUTE leur réponse à l'intérieur de
-    // <thinking>...</thinking> sans rien après. Dans ce cas, stripThinking
-    // retire le bloc entier → displayContent vide → rien n'est jamais
-    // envoyé → "Réponse vide reçue du serveur" côté client.
-    // Fallback A : si aucun chunk n'a été envoyé, on retire seulement les
-    // BALISES <thinking>/</thinking> de `streamedContent` (pas leur contenu)
-    // et on envoie le résultat comme contenu final.
-    if (sentDisplayLength === 0 && streamedContent.trim()) {
-      const fallback = streamedContent.replace(/<\/?thinking>/gi, '').trim();
-      if (fallback) {
-        send({ type: 'chunk', content: fallback });
-        sentDisplayLength = fallback.length;
-      }
-    }
-
-    // FIX 2 : si `streamedContent` (= delta.content) est resté totalement
-    // vide tout le stream (cas owl-alpha sur messages simples — tout est
-    // arrivé via delta.reasoning), on utilise `reasoningContent` comme
-    // contenu de la réponse, nettoyé des balises <thinking> et du JSON des
-    // "steps".
+    // FIX : si `streamedContent` est resté totalement vide tout le stream
+    // (cas owl-alpha sur messages simples — tout est arrivé via
+    // delta.reasoning), on utilise `reasoningContent` comme contenu de la
+    // réponse, en retirant juste d'éventuelles balises <thinking> résiduelles.
+    // Sans ce fallback, le client reçoit "Réponse vide reçue du serveur".
     if (sentDisplayLength === 0 && reasoningContent.trim()) {
-      const fallback = stripStepsJson(reasoningContent);
+      const fallback = stripThinkingArtifacts(reasoningContent);
       if (fallback) {
         send({ type: 'chunk', content: fallback });
         sentDisplayLength = fallback.length;
