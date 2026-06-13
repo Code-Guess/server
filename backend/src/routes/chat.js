@@ -242,6 +242,24 @@ function stripThinking(content) {
   return content;
 }
 
+// ── Nettoyage du JSON des "steps" (utilisé en fallback de reasoning) ─────────
+// FIX : quand le modèle place toute sa réponse dans `delta.reasoning` (cas
+// owl-alpha sur messages simples), ce texte contient souvent encore le bloc
+// JSON `{"steps":[...]}` et/ou les balises <thinking>. On retire les deux
+// avant de l'utiliser comme contenu affiché de secours.
+
+function stripStepsJson(content) {
+  if (!content) return content;
+  let cleaned = stripThinking(content);
+
+  // Retire un éventuel bloc JSON {"steps": [...]} en début de texte
+  cleaned = cleaned.replace(/^\s*\{?\s*"steps"\s*:\s*\[[\s\S]*?\]\s*\}?\s*/i, '');
+  // Retire un objet JSON complet { ... "steps" ... } isolé sur tout le texte
+  cleaned = cleaned.replace(/^\s*\{[\s\S]*?"steps"[\s\S]*?\]\s*\}\s*/i, '');
+
+  return cleaned.trim();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Route principale
 // ─────────────────────────────────────────────────────────────────────────────
@@ -426,11 +444,21 @@ router.post('/', async (req, res) => {
     // envoyé (sentDisplayLength).
     let sentDisplayLength = 0;
 
+    // FIX : certains modèles (owl-alpha) envoient pour les messages simples
+    // TOUT leur texte via `delta.reasoning`, jamais via `delta.content`.
+    // On accumule ce texte séparément pour pouvoir s'en servir en dernier
+    // recours si `streamedContent` (content) reste vide.
+    let reasoningContent = '';
+
     const result = await openRouterFetch({
       model:       resolvedModel,
       max_tokens:  safeMaxTokens,
       temperature: safeTemperature,
       messages,
+
+      onReasoningChunk: (chunk) => {
+        reasoningContent += chunk;
+      },
 
       onChunk: (chunk) => {
         streamedContent += chunk;
@@ -485,15 +513,28 @@ router.post('/', async (req, res) => {
       },
     });
 
-    // FIX: certains modèles placent TOUTE leur réponse à l'intérieur de
+    // FIX 1 : certains modèles placent TOUTE leur réponse à l'intérieur de
     // <thinking>...</thinking> sans rien après. Dans ce cas, stripThinking
     // retire le bloc entier → displayContent vide → rien n'est jamais
     // envoyé → "Réponse vide reçue du serveur" côté client.
-    // Fallback : si aucun chunk n'a été envoyé, on retire seulement les
-    // BALISES <thinking>/</thinking> (pas leur contenu) et on envoie le
-    // résultat comme contenu final.
-    if (sentDisplayLength === 0) {
+    // Fallback A : si aucun chunk n'a été envoyé, on retire seulement les
+    // BALISES <thinking>/</thinking> de `streamedContent` (pas leur contenu)
+    // et on envoie le résultat comme contenu final.
+    if (sentDisplayLength === 0 && streamedContent.trim()) {
       const fallback = streamedContent.replace(/<\/?thinking>/gi, '').trim();
+      if (fallback) {
+        send({ type: 'chunk', content: fallback });
+        sentDisplayLength = fallback.length;
+      }
+    }
+
+    // FIX 2 : si `streamedContent` (= delta.content) est resté totalement
+    // vide tout le stream (cas owl-alpha sur messages simples — tout est
+    // arrivé via delta.reasoning), on utilise `reasoningContent` comme
+    // contenu de la réponse, nettoyé des balises <thinking> et du JSON des
+    // "steps".
+    if (sentDisplayLength === 0 && reasoningContent.trim()) {
+      const fallback = stripStepsJson(reasoningContent);
       if (fallback) {
         send({ type: 'chunk', content: fallback });
         sentDisplayLength = fallback.length;
