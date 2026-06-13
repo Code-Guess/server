@@ -16,15 +16,84 @@ const { runSearchAgent }                     = require('../agents/searchAgents')
 const { runCodePipeline, needsCodePipeline } = require('../agents/codeAgents');
 const { runAgentLoop, needsAgentLoop }       = require('../tools/agentLoop');
 
+// ── Limites de sécurité ───────────────────────────────────────────────────────
+
+const LIMITS = {
+  MESSAGE_MAX_LENGTH:    20_000,
+  MAX_ATTACHMENTS:       5,
+  MAX_TOKENS_CAP:        8_192,
+  MAX_BASE64_SIZE_BYTES: 10 * 1024 * 1024, // 10 Mo par pièce jointe
+  TEMPERATURE_MIN:       0,
+  TEMPERATURE_MAX:       1,
+};
+
 // ── Types MIME acceptés ───────────────────────────────────────────────────────
 
 const ACCEPTED_IMAGE_TYPES = new Set([
-  'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp',
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
 ]);
 
 const ACCEPTED_DOC_TYPES = new Set([
   'application/pdf',
 ]);
+
+// ── Validation des inputs ─────────────────────────────────────────────────────
+
+function validateInputs(message, attachments, max_tokens, temperature) {
+  if (typeof message !== 'string' || message.trim().length === 0) {
+    return 'message requis';
+  }
+  if (message.length > LIMITS.MESSAGE_MAX_LENGTH) {
+    return `message trop long (max ${LIMITS.MESSAGE_MAX_LENGTH} caractères)`;
+  }
+  if (!Array.isArray(attachments)) {
+    return 'attachments doit être un tableau';
+  }
+  if (attachments.length > LIMITS.MAX_ATTACHMENTS) {
+    return `trop de pièces jointes (max ${LIMITS.MAX_ATTACHMENTS})`;
+  }
+  for (const att of attachments) {
+    if (att.base64 && att.base64.length * 0.75 > LIMITS.MAX_BASE64_SIZE_BYTES) {
+      return `pièce jointe trop volumineuse : ${att.name ?? 'inconnue'} (max 10 Mo)`;
+    }
+  }
+  if (max_tokens !== undefined) {
+    const n = Number(max_tokens);
+    if (!Number.isInteger(n) || n < 1) return 'max_tokens invalide';
+  }
+  if (temperature !== undefined) {
+    const t = Number(temperature);
+    if (isNaN(t) || t < LIMITS.TEMPERATURE_MIN || t > LIMITS.TEMPERATURE_MAX) {
+      return `temperature doit être entre ${LIMITS.TEMPERATURE_MIN} et ${LIMITS.TEMPERATURE_MAX}`;
+    }
+  }
+  return null; // OK
+}
+
+// ── Résolution du type de pièce jointe depuis le mimeType (côté serveur) ─────
+
+function resolveAttachmentType(att) {
+  if (!att.mimeType) return null;
+  let mime = att.mimeType.toLowerCase().trim();
+
+  // Normalisation alias
+  if (mime === 'image/jpg') mime = 'image/jpeg';
+
+  // Cas mimeType générique → inférer depuis le nom de fichier
+  if (['application/octet-stream', 'application/x-unknown', ''].includes(mime)) {
+    const name = att.name?.toLowerCase() ?? '';
+    if (name.endsWith('.pdf'))  mime = 'application/pdf';
+    else if (name.endsWith('.jpg') || name.endsWith('.jpeg')) mime = 'image/jpeg';
+    else if (name.endsWith('.png'))  mime = 'image/png';
+    else if (name.endsWith('.gif'))  mime = 'image/gif';
+    else if (name.endsWith('.webp')) mime = 'image/webp';
+    else return null;
+  }
+
+  if (ACCEPTED_IMAGE_TYPES.has(mime))  return { resolvedType: 'image',    resolvedMime: mime };
+  if (ACCEPTED_DOC_TYPES.has(mime))    return { resolvedType: 'document',  resolvedMime: mime };
+  return null;
+}
 
 // ── Construction du contenu user avec pièces jointes ─────────────────────────
 
@@ -39,35 +108,24 @@ function buildUserContent(message, attachments = []) {
       continue;
     }
 
-    if (att.type === 'image') {
-      let mimeType = att.mimeType.toLowerCase();
-      if (mimeType === 'image/jpg') mimeType = 'image/jpeg';
-      if (!ACCEPTED_IMAGE_TYPES.has(mimeType)) {
-        console.warn('[chat] Image ignorée — mimeType non supporté :', mimeType);
-        continue;
-      }
-      blocks.push({
-        type: 'image',
-        source: { type: 'base64', media_type: mimeType, data: att.base64 },
-      });
+    // Type dérivé du mimeType côté serveur, jamais du champ `type` client
+    const resolved = resolveAttachmentType(att);
+    if (!resolved) {
+      console.warn('[chat] Attachment ignoré — type non supporté :', att.mimeType, att.name);
+      continue;
+    }
 
-    } else if (att.type === 'document') {
-      let mimeType = att.mimeType.toLowerCase();
-      if (['application/octet-stream', 'application/x-unknown', ''].includes(mimeType)) {
-        if (att.name?.toLowerCase().endsWith('.pdf')) {
-          mimeType = 'application/pdf';
-        } else {
-          console.warn('[chat] Document ignoré — mimeType non déterminable :', att.name);
-          continue;
-        }
-      }
-      if (!ACCEPTED_DOC_TYPES.has(mimeType)) {
-        console.warn('[chat] Document ignoré — mimeType non supporté :', mimeType);
-        continue;
-      }
+    const { resolvedType, resolvedMime } = resolved;
+
+    if (resolvedType === 'image') {
       blocks.push({
-        type: 'document',
-        source: { type: 'base64', media_type: mimeType, data: att.base64 },
+        type:   'image',
+        source: { type: 'base64', media_type: resolvedMime, data: att.base64 },
+      });
+    } else if (resolvedType === 'document') {
+      blocks.push({
+        type:   'document',
+        source: { type: 'base64', media_type: resolvedMime, data: att.base64 },
       });
     }
   }
@@ -121,6 +179,7 @@ function buildSearchSummary(searchResult) {
 // ── Parser les étapes de thinking partiel ────────────────────────────────────
 
 function parseStepsFromPartial(partial) {
+  // Tentative JSON (avec completions courantes)
   const completions = [partial, partial + ']}', partial + '"]}', partial + '"}]}'];
   for (const attempt of completions) {
     try {
@@ -130,21 +189,31 @@ function parseStepsFromPartial(partial) {
       }
     } catch {}
   }
+
+  // Fallback regex sur "title"
   const matches = [...partial.matchAll(/"title"\s*:\s*"([^"\\]+)"/g)];
   if (matches.length > 0) return matches.map(m => ({ title: m[1] }));
-  const lines = partial.split('\n')
-    .map(l => l.replace(/^[-*•#>\d.)\s]+/, '').trim())
-    .filter(l => l.length > 4);
-  if (lines.length > 0) return lines.slice(0, 4).map(l => ({ title: l.slice(0, 80) }));
+
+  // Pas de fallback texte libre — trop risqué (prose / code visible dans l'UI)
   return [];
 }
 
 // ── Nettoyage du contenu affiché (retire les balises <thinking>) ──────────────
 
 function stripThinking(content) {
-  return content
-    .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
-    .trimStart();
+  // Cas normal : tag fermé
+  if (content.includes('</thinking>')) {
+    return content
+      .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
+      .trimStart();
+  }
+  // Tag ouvert mais jamais fermé (timeout / erreur mid-stream)
+  // → on garde seulement ce qui précède <thinking>
+  const idx = content.indexOf('<thinking>');
+  if (idx !== -1) {
+    return content.slice(0, idx).trimEnd();
+  }
+  return content;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -154,23 +223,37 @@ function stripThinking(content) {
 router.post('/', async (req, res) => {
   const {
     message,
-    history      = [],
-    model        = 'opus',
-    deepResearch = false,
+    history     = [],
+    model,
     max_tokens,
     temperature,
-    attachments  = [],
+    attachments = [],
   } = req.body;
 
-  if (!message || typeof message !== 'string') {
-    return res.status(400).json({ error: 'message requis' });
+  // ── Strict boolean : jamais de valeur truthy arbitraire ───────────────────
+  const deepResearch = req.body.deepResearch === true;
+
+  // ── Validation des inputs ─────────────────────────────────────────────────
+  const validationError = validateInputs(message, attachments, max_tokens, temperature);
+  if (validationError) {
+    return res.status(400).json({ error: validationError });
   }
+
+  // ── Valeurs sécurisées ────────────────────────────────────────────────────
+  const resolvedModel       = typeof model === 'string' && model.trim().length > 0
+    ? model.trim()
+    : 'opus';
+  const safeMaxTokens       = Math.min(Number(max_tokens)  || 8192, LIMITS.MAX_TOKENS_CAP);
+  const safeTemperature     = Math.max(
+    LIMITS.TEMPERATURE_MIN,
+    Math.min(LIMITS.TEMPERATURE_MAX, Number(temperature) || 0.7)
+  );
 
   if (attachments.length > 0) {
     console.log(
       `[chat] ${attachments.length} pièce(s) jointe(s) :`,
       attachments.map(a =>
-        `${a.name} (${a.type}, ${a.mimeType}, ${
+        `${a.name} (${a.mimeType}, ${
           a.base64 ? Math.round(a.base64.length / 1024) + ' Ko' : 'ABSENT'
         })`
       ).join(', ')
@@ -185,12 +268,29 @@ router.post('/', async (req, res) => {
   res.flushHeaders();
 
   const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-  const done = ()      => { res.write('data: [DONE]\n\n'); res.end(); };
+
+  // Guard : done() ne peut être appelé qu'une seule fois
+  let isDone = false;
+  const done = () => {
+    if (isDone) return;
+    isDone = true;
+    res.write('data: [DONE]\n\n');
+    res.end();
+  };
 
   // ── Helper : construction des messages history ────────────────────────────
+  // Sécurité : on n'accepte que 'user' et 'assistant', jamais 'system'
+  const VALID_ROLES = new Set(['user', 'assistant']);
+
   function buildHistory() {
-    return (history ?? [])
-      .filter(m => m.role && m.content)
+    return (Array.isArray(history) ? history : [])
+      .filter(m =>
+        m &&
+        typeof m === 'object' &&
+        VALID_ROLES.has(m.role) &&
+        m.content &&
+        typeof m.content === 'string'
+      )
       .map(m => ({
         role:    m.role,
         content: m.role === 'assistant' ? stripThinking(m.content) : m.content,
@@ -200,7 +300,7 @@ router.post('/', async (req, res) => {
 
   try {
 
-    // ── 1. Pipeline code (deep research) ─────────────────────────────────────
+    // ── 1. Pipeline code (deep research) ──────────────────────────────────────
     if (deepResearch && needsCodePipeline(message)) {
       await runCodePipeline(message, (agentSteps) => {
         send({ type: 'pipeline', steps: agentSteps });
@@ -211,7 +311,7 @@ router.post('/', async (req, res) => {
       return;
     }
 
-    // ── 2. Agent loop (execute_code / edit_file) ──────────────────────────────
+    // ── 2. Agent loop (execute_code / edit_file) ───────────────────────────────
     if (!deepResearch && needsAgentLoop(message)) {
       const systemPrompt = getSystemPrompt(message, undefined);
       const userContent  = buildUserContent(message, attachments);
@@ -225,14 +325,14 @@ router.post('/', async (req, res) => {
       await runAgentLoop({
         res,
         messages,
-        model:       model ?? 'sonnet',
-        max_tokens:  max_tokens  ?? 8192,
-        temperature: temperature ?? 0.2,
+        model:       'sonnet',          // agent loop utilise toujours sonnet
+        max_tokens:  safeMaxTokens,
+        temperature: safeTemperature,
       });
       return;
     }
 
-    // ── 3. Recherche web ──────────────────────────────────────────────────────
+    // ── 3. Recherche web ───────────────────────────────────────────────────────
     let systemContext = '';
     let sources       = [];
     const shouldSearch = message.trim().length >= 8 && needsSearch(message);
@@ -267,7 +367,7 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // ── 4. Construction des messages ──────────────────────────────────────────
+    // ── 4. Construction des messages ───────────────────────────────────────────
     const systemPrompt = getSystemPrompt(message, systemContext || undefined);
     const userContent  = buildUserContent(message, attachments);
 
@@ -277,43 +377,61 @@ router.post('/', async (req, res) => {
       { role: 'user', content: userContent },
     ];
 
-    // ── 5. Appel LLM (prefill arith-table géré automatiquement dans openrouter.js)
+    // ── 5. Appel LLM ──────────────────────────────────────────────────────────
     let streamedContent = '';
 
     const result = await openRouterFetch({
-      model:       model ?? 'opus',
-      max_tokens:  max_tokens  ?? 8192,
-      temperature: temperature ?? 0.7,
+      model:       resolvedModel,
+      max_tokens:  safeMaxTokens,
+      temperature: safeTemperature,
       messages,
 
       onChunk: (fullContent) => {
         streamedContent = fullContent;
 
-        // Thinking steps
-        const thinkMatch = streamedContent.match(/<thinking>([\s\S]*)/);
-        if (thinkMatch) {
-          const partial = thinkMatch[1];
+        const hasOpen  = streamedContent.includes('<thinking>');
+        const hasClose = streamedContent.includes('</thinking>');
+
+        // Thinking en cours : parser les étapes et envoyer ce qui précède
+        if (hasOpen && !hasClose) {
+          const before = streamedContent
+            .slice(0, streamedContent.indexOf('<thinking>'))
+            .trimEnd();
+          if (before) send({ type: 'chunk', content: before });
+
+          const partial = streamedContent.split('<thinking>')[1] ?? '';
           const steps   = parseStepsFromPartial(partial);
           if (steps.length > 0) {
-            const thinkingComplete = streamedContent.includes('</thinking>');
             send({
               type:  'thinkingSteps',
               steps: steps.map((s, i) => ({
                 label: s.title,
                 icon:  'think',
-                done:  thinkingComplete || i < steps.length - 1,
+                done:  false,
+              })),
+            });
+          }
+          return;
+        }
+
+        // Thinking fermé : envoyer le contenu nettoyé
+        if (hasOpen && hasClose) {
+          const partial = streamedContent.split('<thinking>')[1]?.split('</thinking>')[0] ?? '';
+          const steps   = parseStepsFromPartial(partial);
+          if (steps.length > 0) {
+            send({
+              type:  'thinkingSteps',
+              steps: steps.map((s, i) => ({
+                label: s.title,
+                icon:  'think',
+                done:  true,
               })),
             });
           }
         }
 
-        // N'envoyer le contenu affiché qu'une fois le thinking fermé
-        if (!streamedContent.includes('</thinking>')) return;
-
         const displayContent = stripThinking(streamedContent);
-        if (!displayContent) return;
-
-        send({ type: 'chunk', content: displayContent });
+        if (displayContent) send({ type: 'chunk', content: displayContent });
       },
     });
 
