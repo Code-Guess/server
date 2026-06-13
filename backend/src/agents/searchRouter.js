@@ -5,26 +5,39 @@
 
 const { runSearchAgent } = require('./searchAgents');
 
-// ── Requêtes qui ne nécessitent PAS de recherche web ─────────────────────────
-// (maths pures, demandes de reformulation, salutations, etc.)
+// ── Timeout global pour la recherche (ms) ────────────────────────────────────
+const SEARCH_TIMEOUT_MS = 12000;
 
+// ── Requêtes qui ne nécessitent PAS de recherche web ─────────────────────────
+// Normalise les accents pour matcher "resume", "résume", "reformule", etc.
 const NO_SEARCH_PATTERNS = [
   /^(bonjour|salut|hello|hi|hey|bonsoir|coucou)\b/i,
   /^(merci|thanks|thank you)\b/i,
-  /^\d[\d\s+\-*/^().,]*$/,                        // calcul pur
-  /^(résume|reformule|traduis|corrige|améliore)\s/i, // action sur texte fourni
+  /^\d[\d\s+\-*/^().,]*$/,                                          // calcul pur
+  /^(resumes?|reformule|traduis|corrige|ameliore|resume)\s/i,        // sans accents
+  /^(r[eé]sum[eé]|r[eé]formule|traduis|corrige|am[eé]liore)\s/i,    // avec accents
   /^(continue|vas-y|ok|oui|non|d'accord)\b/i,
   /^(quel est ton nom|qui es-tu|tu es qui|what are you)\b/i,
 ];
 
-function needsSearch(query) {
-  const q = query.trim();
-  if (q.length < 8) return false; // trop court
-  return !NO_SEARCH_PATTERNS.some(re => re.test(q));
+// ── Normalise une string (minuscules + sans accents) ──────────────────────────
+function normalize(str) {
+  return str.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }
 
-// ── Injection du contexte de recherche dans les messages ──────────────────────
+function needsSearch(query) {
+  // Validation stricte du type
+  if (!query || typeof query !== 'string') return false;
 
+  const q = query.trim();
+  if (q.length < 8) return false;
+
+  // Tester sur la version normalisée (sans accents) ET originale
+  const qNorm = normalize(q);
+  return !NO_SEARCH_PATTERNS.some(re => re.test(q) || re.test(qNorm));
+}
+
+// ── withSearch ────────────────────────────────────────────────────────────────
 /**
  * withSearch(query, messages, options)
  *
@@ -44,73 +57,112 @@ function needsSearch(query) {
 async function withSearch(query, messages, options = {}) {
   const { forceAgent, skipSearch = false, onSearchDone } = options;
 
-  // 1. Vérifier si la recherche est pertinente
-  if (skipSearch || !needsSearch(query)) {
-    return { messages, searchResult: null };
+  // Validation query
+  if (!query || typeof query !== 'string') {
+    console.warn('[SearchRouter] Query invalide:', query);
+    return { messages: Array.isArray(messages) ? messages : [], searchResult: null };
   }
 
-  // 2. Lancer la recherche en parallèle (non-bloquant côté perf)
+  // Validation messages
+  const safeMessages = Array.isArray(messages) ? messages : [];
+
+  // 1. Vérifier si la recherche est pertinente
+  if (skipSearch || !needsSearch(query)) {
+    return { messages: safeMessages, searchResult: null };
+  }
+
+  // 2. Lancer la recherche avec timeout global
   let searchResult = null;
   try {
-    searchResult = await runSearchAgent(query, forceAgent);
+    searchResult = await Promise.race([
+      runSearchAgent(query, forceAgent),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`Timeout recherche après ${SEARCH_TIMEOUT_MS}ms`)), SEARCH_TIMEOUT_MS)
+      ),
+    ]);
   } catch (err) {
     console.warn('[SearchRouter] Recherche échouée:', err.message);
-    return { messages, searchResult: null };
+    return { messages: safeMessages, searchResult: null };
   }
 
   // 3. Callback optionnel (ex: afficher "🔍 5 sources trouvées" dans l'UI)
   if (onSearchDone && searchResult) {
-    try { onSearchDone(searchResult); } catch {}
+    try {
+      onSearchDone(searchResult);
+    } catch (err) {
+      console.warn('[SearchRouter] onSearchDone callback error:', err.message);
+    }
   }
 
   // 4. Pas de résultats → passer sans contexte
   if (!searchResult?.contextBlock) {
-    return { messages, searchResult };
+    return { messages: safeMessages, searchResult };
   }
 
   // 5. Injecter le contexte de recherche dans les messages
-  //    On l'ajoute comme dernier message "user" juste avant la requête réelle,
-  //    de façon transparente pour le LLM.
-  const enrichedMessages = injectSearchContext(messages, query, searchResult.contextBlock);
+  const enrichedMessages = injectSearchContext(safeMessages, query, searchResult.contextBlock);
 
   return { messages: enrichedMessages, searchResult };
 }
 
+// ── injectSearchContext ───────────────────────────────────────────────────────
 /**
  * Injecte le bloc de recherche dans l'historique.
- * Stratégie : remplacer le dernier message user par une version enrichie.
+ * Stratégie : enrichir le dernier message user en préservant
+ * le format original (string OU array multipart).
  */
 function injectSearchContext(messages, query, contextBlock) {
   const copy = messages.map(m => ({ ...m }));
 
   // Trouver le dernier message utilisateur
-  const lastUserIdx = copy.map(m => m.role).lastIndexOf('user');
+  const lastUserIdx = copy.findLastIndex
+    ? copy.findLastIndex(m => m.role === 'user')                  // Node 18+
+    : copy.map(m => m.role).lastIndexOf('user');                  // fallback
 
   if (lastUserIdx === -1) {
     // Pas de message user trouvé → ajouter directement
-    copy.push({
-      role: 'user',
-      content: `${query}${contextBlock}`,
-    });
+    copy.push({ role: 'user', content: `${query}${contextBlock}` });
     return copy;
   }
 
-  // Enrichir le dernier message user avec le contexte
   const lastUser = copy[lastUserIdx];
-  const originalContent = typeof lastUser.content === 'string'
-    ? lastUser.content
-    : lastUser.content?.find?.(b => b.type === 'text')?.text ?? query;
 
-  copy[lastUserIdx] = {
-    ...lastUser,
-    content: `${originalContent}${contextBlock}`,
-  };
+  if (typeof lastUser.content === 'string') {
+    // Cas simple : content string
+    copy[lastUserIdx] = {
+      ...lastUser,
+      content: `${lastUser.content}${contextBlock}`,
+    };
+  } else if (Array.isArray(lastUser.content)) {
+    // Cas multipart : trouver le bloc texte et l'enrichir
+    // sans détruire les autres blocs (images, documents, etc.)
+    const newBlocks = lastUser.content.map(block => {
+      if (block.type === 'text') {
+        return { ...block, text: `${block.text}${contextBlock}` };
+      }
+      return block; // image, document, etc. → préservés tels quels
+    });
+
+    // Si aucun bloc texte n'existait, en ajouter un
+    const hasTextBlock = lastUser.content.some(b => b.type === 'text');
+    if (!hasTextBlock) {
+      newBlocks.push({ type: 'text', text: contextBlock });
+    }
+
+    copy[lastUserIdx] = { ...lastUser, content: newBlocks };
+  } else {
+    // Fallback : format inconnu → forcer string
+    console.warn('[SearchRouter] Format content inconnu, fallback string:', typeof lastUser.content);
+    copy[lastUserIdx] = {
+      ...lastUser,
+      content: `${query}${contextBlock}`,
+    };
+  }
 
   return copy;
 }
 
 // ── Système prompt recommandé pour mode Perplexity ────────────────────────────
-
 const PERPLEXITY_SYSTEM_PROMPT = `Tu es un assistant de recherche intelligent. 
 Pour chaque réponse :
 - Utilise les sources fournies dans le contexte pour répondre avec des informations à jour.
