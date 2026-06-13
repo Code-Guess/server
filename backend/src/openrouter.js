@@ -24,7 +24,6 @@ const MAX_TOKENS = {
 };
 
 // ─── Round-robin state ────────────────────────────────────────────────────────
-// Index courant partagé entre les appels pour distribuer les requêtes
 let keyIndex = 0;
 
 function getNextKey() {
@@ -35,7 +34,6 @@ function getNextKey() {
   return key;
 }
 
-// Gardé pour compatibilité avec les exports existants
 function getAvailableKeys() {
   if (KEYS.length === 0) throw new Error('Aucune clé OpenRouter configurée.');
   return KEYS;
@@ -44,7 +42,6 @@ function getAvailableKeys() {
 // ─── Arith Prefill ────────────────────────────────────────────────────────────
 
 const ARITH_TRIGGERS = [
-  // Conversion de base — patterns spécifiques EN PREMIER
   {
     regex:   /(?:écrire?|convertir?|exprimer?|donner?|passer?).{0,50}base\s*\d+/i,
     prefill: '```arith-table\n{"kind":"base-conversion",',
@@ -57,52 +54,40 @@ const ARITH_TRIGGERS = [
     regex:   /\(\s*\d+\s*\)\s*_?\s*\d+/,
     prefill: '```arith-table\n{"kind":"base-conversion",',
   },
-  // Binaire (addition / multiplication) — avant le catch-all binaire
   {
     regex:   /(?:addition|multiplica|opéra).{0,30}(?:binaire|base\s*2)/i,
     prefill: '```arith-table\n{"kind":"binary-operation",',
   },
-  // Table d'opération binaire — avant le catch-all binaire
   {
     regex:   /table\s+(?:d.addition|de\s+multiplication).{0,20}(?:binaire|base\s*2)/i,
     prefill: '```arith-table\n{"kind":"binary-op-table",',
   },
-  // Euclide / PGCD — avant le catch-all binaire
   {
     regex:   /pgcd|euclide|algorithme\s+d.euclide/i,
     prefill: '```arith-table\n{"kind":"euclid-algorithm",',
   },
-  // Bézout — avant le catch-all binaire
   {
     regex:   /b[eé]zout/i,
     prefill: '```arith-table\n{"kind":"bezout-table",',
   },
-  // Factorisation — avant le catch-all binaire
   {
     regex:   /factori(?:ser?|sation)|décompos.{0,30}premier/i,
     prefill: '```arith-table\n{"kind":"prime-factorization",',
   },
-  // Crible d'Ératosthène — avant le catch-all binaire
   {
     regex:   /crible|[eé]ratosth[eè]ne/i,
     prefill: '```arith-table\n{"kind":"sieve-eratosthenes",',
   },
-  // Diviseurs — avant le catch-all binaire
   {
     regex:   /diviseurs?\s+de\s+\d+/i,
     prefill: '```arith-table\n{"kind":"divisors-search",',
   },
-  // ⚠️ Catch-all binaire EN DERNIER pour ne pas écraser les triggers ci-dessus
   {
     regex:   /binaire|base\s*2/i,
     prefill: '```arith-table\n{"kind":"base-conversion",',
   },
 ];
 
-/**
- * Cherche dans le dernier message user si une figure arith-table est requise.
- * Retourne le préfixe à injecter ou null.
- */
 function getArithPrefill(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return null;
@@ -161,7 +146,6 @@ function convertToOpenAIFormat(messages) {
 async function openRouterFetch(options) {
   const tier      = options.model ?? 'opus';
   const maxTokens = options.max_tokens ?? MAX_TOKENS[tier] ?? 16_000;
-  // stream: true par défaut sauf si explicitement false
   const useStream = options.stream !== false;
 
   const isMultimodal = hasMultimodalContent(options.messages ?? []);
@@ -174,14 +158,12 @@ async function openRouterFetch(options) {
     ? convertToOpenAIFormat(options.messages ?? [])
     : (options.messages ?? []);
 
-  // ── Prefill arith-table (seulement en mode stream, pas multimodal) ──────
   const prefill = (isMultimodal || !useStream) ? null : getArithPrefill(messages);
 
   if (prefill) {
     messages = [...messages, { role: 'assistant', content: prefill }];
   }
 
-  // ── Round-robin : essayer chaque clé jusqu'à succès ─────────────────────
   const keys = getAvailableKeys();
   let lastError = null;
 
@@ -213,23 +195,35 @@ async function openRouterFetch(options) {
     } catch (fetchErr) {
       console.warn(`[OpenRouter] Fetch réseau échoué (clé ...${key.slice(-6)}):`, fetchErr.message);
       lastError = fetchErr;
-      continue; // essayer la clé suivante
+      continue;
     }
 
-    // Retry sur 429 (quota) ou 5xx (erreur serveur transitoire)
-    if (res.status === 429 || res.status >= 500) {
-      const body = await res.json().catch(() => ({}));
-      console.warn(`[OpenRouter] HTTP ${res.status} (clé ...${key.slice(-6)}):`, body?.error?.message ?? '');
-      lastError = new Error(body?.error?.message ?? `Erreur HTTP ${res.status}`);
-      continue; // essayer la clé suivante
-    }
-
+    // ── Gestion des erreurs HTTP ───────────────────────────────────────────
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err?.error?.message ?? `Erreur HTTP ${res.status}`);
+      let errBody = {};
+      try { errBody = await res.json(); } catch {}
+
+      const errMsg  = errBody?.error?.message ?? `Erreur HTTP ${res.status}`;
+      const isProviderError = errBody?.error?.code === 'provider_error'
+        || errMsg.toLowerCase().includes('provider')
+        || errMsg.toLowerCase().includes('overloaded')
+        || errMsg.toLowerCase().includes('unavailable');
+
+      console.warn(
+        `[OpenRouter] HTTP ${res.status} (clé ...${key.slice(-6)}) | provider_error=${isProviderError} | msg: ${errMsg}`
+      );
+
+      // 429, 5xx, ou erreur provider → retry avec la clé suivante
+      if (res.status === 429 || res.status >= 500 || isProviderError) {
+        lastError = new Error(errMsg);
+        continue;
+      }
+
+      // Autres 4xx (400 malformed, 401 auth…) → fail immédiat
+      throw new Error(errMsg);
     }
 
-    // ── Mode NON-stream (ex: rephraseForSearch) ────────────────────────────
+    // ── Mode NON-stream ────────────────────────────────────────────────────
     if (!useStream) {
       const data = await res.json();
       const rawContent = data.choices?.[0]?.message?.content ?? '';
@@ -243,17 +237,6 @@ async function openRouterFetch(options) {
 
     let content   = '';
     let reasoning = '';
-
-    // FIX : certains modèles (ex: openrouter/owl-alpha) envoient TOUT leur
-    // texte — y compris la réponse réelle pour des messages simples — via
-    // `delta.reasoning` et non `delta.content`. Avant ce fix, ces deltas
-    // étaient accumulés dans `reasoning` mais jamais transmis au caller via
-    // onChunk : pour ces messages, `onChunk` n'était JAMAIS appelé,
-    // `streamedContent` restait vide côté chat.js, et le client recevait
-    // "Réponse vide reçue du serveur".
-    // On expose donc un nouveau callback `onReasoningChunk` pour que
-    // chat.js puisse utiliser ce texte comme fallback si `content` reste
-    // vide à la fin du stream.
 
     const reader  = res.body.getReader();
     const decoder = new TextDecoder();
@@ -272,30 +255,44 @@ async function openRouterFetch(options) {
         if (payload === '[DONE]') continue;
 
         try {
-          const { choices } = JSON.parse(payload);
+          const parsed = JSON.parse(payload);
+
+          // FIX : certains streams renvoient une erreur provider DANS le stream
+          // (HTTP 200 mais body contient { error: ... })
+          // On la détecte ici pour retry proprement.
+          if (parsed?.error) {
+            const streamErrMsg = parsed.error?.message ?? 'Provider error in stream';
+            console.warn(`[OpenRouter] Erreur dans le stream (clé ...${key.slice(-6)}):`, streamErrMsg);
+            lastError = new Error(streamErrMsg);
+            // Fermer le reader et passer à la clé suivante
+            try { await reader.cancel(); } catch {}
+            break;
+          }
+
+          const { choices } = parsed;
           const delta = choices?.[0]?.delta;
 
           if (delta?.content) {
             content += delta.content;
-            // ← on passe delta.content (le nouveau morceau uniquement),
-            //   pas `content` cumulé, pour que le caller puisse streamer
-            //   correctement sans dupliquer le texte.
             options.onChunk?.(delta.content);
           }
           if (delta?.reasoning) {
             reasoning += delta.reasoning;
-            // FIX : transmettre aussi le delta de reasoning au caller
             options.onReasoningChunk?.(delta.reasoning);
           }
         } catch {
           // chunk malformé → on ignore
         }
       }
+
+      // Si on a détecté une erreur dans le stream, sortir du while
+      if (lastError && content === '' && reasoning === '') break;
     }
 
-    // ── Recoller le prefill si OpenRouter ne le répète pas ─────────────────
-    // Vérification défensive : si le stream a déjà inclus le prefill,
-    // ne pas le dupliquer.
+    // Si erreur stream sans contenu → retry
+    if (lastError && content === '' && reasoning === '') continue;
+
+    // ── Recoller le prefill si besoin ──────────────────────────────────────
     const finalContent = prefill
       ? (content.startsWith(prefill) ? content : prefill + content)
       : content;
