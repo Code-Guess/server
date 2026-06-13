@@ -244,6 +244,17 @@ async function openRouterFetch(options) {
     let content   = '';
     let reasoning = '';
 
+    // FIX : certains modèles (ex: openrouter/owl-alpha) envoient TOUT leur
+    // texte — y compris la réponse réelle pour des messages simples — via
+    // `delta.reasoning` et non `delta.content`. Avant ce fix, ces deltas
+    // étaient accumulés dans `reasoning` mais jamais transmis au caller via
+    // onChunk : pour ces messages, `onChunk` n'était JAMAIS appelé,
+    // `streamedContent` restait vide côté chat.js, et le client recevait
+    // "Réponse vide reçue du serveur".
+    // On expose donc un nouveau callback `onReasoningChunk` pour que
+    // chat.js puisse utiliser ce texte comme fallback si `content` reste
+    // vide à la fin du stream.
+
     const reader  = res.body.getReader();
     const decoder = new TextDecoder();
 
@@ -273,6 +284,8 @@ async function openRouterFetch(options) {
           }
           if (delta?.reasoning) {
             reasoning += delta.reasoning;
+            // FIX : transmettre aussi le delta de reasoning au caller
+            options.onReasoningChunk?.(delta.reasoning);
           }
         } catch {
           // chunk malformé → on ignore
