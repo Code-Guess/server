@@ -194,7 +194,6 @@ function parseStepsFromPartial(partial) {
   const matches = [...partial.matchAll(/"title"\s*:\s*"([^"\\]+)"/g)];
   if (matches.length > 0) return matches.map(m => ({ title: m[1] }));
 
-  // Pas de fallback texte libre — trop risqué (prose / code visible dans l'UI)
   return [];
 }
 
@@ -279,7 +278,6 @@ router.post('/', async (req, res) => {
   };
 
   // ── Helper : construction des messages history ────────────────────────────
-  // Sécurité : on n'accepte que 'user' et 'assistant', jamais 'system'
   const VALID_ROLES = new Set(['user', 'assistant']);
 
   function buildHistory() {
@@ -325,7 +323,7 @@ router.post('/', async (req, res) => {
       await runAgentLoop({
         res,
         messages,
-        model:       'sonnet',          // agent loop utilise toujours sonnet
+        model:       'sonnet',
         max_tokens:  safeMaxTokens,
         temperature: safeTemperature,
       });
@@ -378,7 +376,8 @@ router.post('/', async (req, res) => {
     ];
 
     // ── 5. Appel LLM ──────────────────────────────────────────────────────────
-    let streamedContent = '';
+    let streamedContent  = '';
+    let lastSentThinking = ''; // ← NOUVEAU : pour envoyer seulement le delta du thinking
 
     const result = await openRouterFetch({
       model:       resolvedModel,
@@ -392,44 +391,55 @@ router.post('/', async (req, res) => {
         const hasOpen  = streamedContent.includes('<thinking>');
         const hasClose = streamedContent.includes('</thinking>');
 
-        // Thinking en cours : parser les étapes et envoyer ce qui précède
+        // ── Thinking en cours (tag ouvert, pas encore fermé) ──────────────────
         if (hasOpen && !hasClose) {
+          // Envoyer le contenu AVANT <thinking> (une seule fois)
           const before = streamedContent
             .slice(0, streamedContent.indexOf('<thinking>'))
             .trimEnd();
           if (before) send({ type: 'chunk', content: before });
 
-          const partial = streamedContent.split('<thinking>')[1] ?? '';
-          const steps   = parseStepsFromPartial(partial);
+          // ← CORRIGÉ : envoyer le delta brut du thinking en temps réel
+          const thinkingFull  = streamedContent.split('<thinking>')[1] ?? '';
+          const thinkingDelta = thinkingFull.slice(lastSentThinking.length);
+
+          if (thinkingDelta.length > 0) {
+            send({ type: 'thinking', content: thinkingDelta });
+            lastSentThinking = thinkingFull;
+          }
+
+          // Tenter quand même de parser des steps (optionnel, pour UI avancée)
+          const steps = parseStepsFromPartial(thinkingFull);
           if (steps.length > 0) {
             send({
               type:  'thinkingSteps',
-              steps: steps.map((s, i) => ({
-                label: s.title,
-                icon:  'think',
-                done:  false,
-              })),
+              steps: steps.map(s => ({ label: s.title, icon: 'think', done: false })),
             });
           }
           return;
         }
 
-        // Thinking fermé : envoyer le contenu nettoyé
+        // ── Thinking fermé : envoyer les steps finales + contenu propre ────────
         if (hasOpen && hasClose) {
-          const partial = streamedContent.split('<thinking>')[1]?.split('</thinking>')[0] ?? '';
-          const steps   = parseStepsFromPartial(partial);
+          const thinkingFull  = streamedContent.split('<thinking>')[1]?.split('</thinking>')[0] ?? '';
+
+          // Envoyer l'éventuel delta de thinking restant avant la fermeture
+          const thinkingDelta = thinkingFull.slice(lastSentThinking.length);
+          if (thinkingDelta.length > 0) {
+            send({ type: 'thinking', content: thinkingDelta });
+            lastSentThinking = thinkingFull;
+          }
+
+          const steps = parseStepsFromPartial(thinkingFull);
           if (steps.length > 0) {
             send({
               type:  'thinkingSteps',
-              steps: steps.map((s, i) => ({
-                label: s.title,
-                icon:  'think',
-                done:  true,
-              })),
+              steps: steps.map(s => ({ label: s.title, icon: 'think', done: true })),
             });
           }
         }
 
+        // Contenu visible (hors thinking)
         const displayContent = stripThinking(streamedContent);
         if (displayContent) send({ type: 'chunk', content: displayContent });
       },
