@@ -217,9 +217,14 @@ function parseStepsFromPartial(partial) {
 
 // ── Nettoyage du contenu affiché (retire les balises <thinking>) ──────────────
 // FIX: robuste sur tags partiels, insensible à la casse, gère aussi </thinking>
+// FIX 2: tolère les balises malformées type "<th<thinking>" générées par
+// certains modèles lorsqu'un prefill se chevauche avec le début du flux.
 
 function stripThinking(content) {
   if (!content) return content;
+
+  // Normaliser les balises ouvrantes malformées (ex: "<th<thinking>" → "<thinking>")
+  content = content.replace(/<[a-zA-Z]{0,9}(<thinking>)/gi, '$1');
 
   // Tags complets (toutes variantes)
   if (/<\/thinking>/i.test(content)) {
@@ -411,6 +416,16 @@ router.post('/', async (req, res) => {
     // L'ancien code renvoyait `before` à chaque chunk → duplication côté client
     let thinkingStartSent = false;
 
+    // FIX MAJEUR: on envoie désormais des DELTAS au client (pas le total
+    // accumulé). L'ancien code envoyait `stripThinking(streamedContent)`
+    // (= tout le texte affiché depuis le début) à CHAQUE chunk, et le client
+    // fait `result.content += event.content` → accumulation d'accumulations,
+    // donc répétition exponentielle du texte ("Salut ! Je suis NerosiaSalut !
+    // Je suis Nerosia. Comment puis-..."). On ne renvoie maintenant que la
+    // portion nouvelle de `displayContent` par rapport à ce qui a déjà été
+    // envoyé (sentDisplayLength).
+    let sentDisplayLength = 0;
+
     const result = await openRouterFetch({
       model:       resolvedModel,
       max_tokens:  safeMaxTokens,
@@ -430,7 +445,10 @@ router.post('/', async (req, res) => {
             thinkingStartSent = true;
             const openIdx = streamedContent.search(/<thinking>/i);
             const before  = streamedContent.slice(0, openIdx).trimEnd();
-            if (before) send({ type: 'chunk', content: before });
+            if (before) {
+              send({ type: 'chunk', content: before });
+              sentDisplayLength = before.length;
+            }
           }
 
           const partial = streamedContent.split(/<thinking>/i)[1] ?? '';
@@ -457,9 +475,13 @@ router.post('/', async (req, res) => {
           }
         }
 
-        // Envoyer le contenu nettoyé (sans balises thinking)
+        // Envoyer uniquement le delta du contenu nettoyé (sans balises thinking)
         const displayContent = stripThinking(streamedContent);
-        if (displayContent) send({ type: 'chunk', content: displayContent });
+        if (displayContent.length > sentDisplayLength) {
+          const delta = displayContent.slice(sentDisplayLength);
+          if (delta) send({ type: 'chunk', content: delta });
+          sentDisplayLength = displayContent.length;
+        }
       },
     });
 
