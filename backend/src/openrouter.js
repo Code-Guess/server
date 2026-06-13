@@ -23,10 +23,28 @@ const MAX_TOKENS = {
   haiku:  4_096,
 };
 
+// ─── Round-robin state ────────────────────────────────────────────────────────
+// Index courant partagé entre les appels pour distribuer les requêtes
+let keyIndex = 0;
+
+function getNextKey() {
+  const keys = KEYS;
+  if (keys.length === 0) throw new Error('Aucune clé OpenRouter configurée.');
+  const key = keys[keyIndex % keys.length];
+  keyIndex = (keyIndex + 1) % keys.length;
+  return key;
+}
+
+// Gardé pour compatibilité avec les exports existants
+function getAvailableKeys() {
+  if (KEYS.length === 0) throw new Error('Aucune clé OpenRouter configurée.');
+  return KEYS;
+}
+
 // ─── Arith Prefill ────────────────────────────────────────────────────────────
 
 const ARITH_TRIGGERS = [
-  // Conversion de base
+  // Conversion de base — patterns spécifiques EN PREMIER
   {
     regex:   /(?:écrire?|convertir?|exprimer?|donner?|passer?).{0,50}base\s*\d+/i,
     prefill: '```arith-table\n{"kind":"base-conversion",',
@@ -39,44 +57,45 @@ const ARITH_TRIGGERS = [
     regex:   /\(\s*\d+\s*\)\s*_?\s*\d+/,
     prefill: '```arith-table\n{"kind":"base-conversion",',
   },
-  // Binaire (addition / multiplication)
+  // Binaire (addition / multiplication) — avant le catch-all binaire
   {
     regex:   /(?:addition|multiplica|opéra).{0,30}(?:binaire|base\s*2)/i,
     prefill: '```arith-table\n{"kind":"binary-operation",',
   },
+  // Table d'opération binaire — avant le catch-all binaire
   {
-    regex:   /binaire|base\s*2/i,
-    prefill: '```arith-table\n{"kind":"base-conversion",',
+    regex:   /table\s+(?:d.addition|de\s+multiplication).{0,20}(?:binaire|base\s*2)/i,
+    prefill: '```arith-table\n{"kind":"binary-op-table",',
   },
-  // Euclide / PGCD
+  // Euclide / PGCD — avant le catch-all binaire
   {
     regex:   /pgcd|euclide|algorithme\s+d.euclide/i,
     prefill: '```arith-table\n{"kind":"euclid-algorithm",',
   },
-  // Bézout
+  // Bézout — avant le catch-all binaire
   {
     regex:   /b[eé]zout/i,
     prefill: '```arith-table\n{"kind":"bezout-table",',
   },
-  // Factorisation
+  // Factorisation — avant le catch-all binaire
   {
     regex:   /factori(?:ser?|sation)|décompos.{0,30}premier/i,
     prefill: '```arith-table\n{"kind":"prime-factorization",',
   },
-  // Crible d'Ératosthène
+  // Crible d'Ératosthène — avant le catch-all binaire
   {
     regex:   /crible|[eé]ratosth[eè]ne/i,
     prefill: '```arith-table\n{"kind":"sieve-eratosthenes",',
   },
-  // Diviseurs
+  // Diviseurs — avant le catch-all binaire
   {
     regex:   /diviseurs?\s+de\s+\d+/i,
     prefill: '```arith-table\n{"kind":"divisors-search",',
   },
-  // Table d'opération binaire
+  // ⚠️ Catch-all binaire EN DERNIER pour ne pas écraser les triggers ci-dessus
   {
-    regex:   /table\s+(?:d.addition|de\s+multiplication).{0,20}(?:binaire|base\s*2)/i,
-    prefill: '```arith-table\n{"kind":"binary-op-table",',
+    regex:   /binaire|base\s*2/i,
+    prefill: '```arith-table\n{"kind":"base-conversion",',
   },
 ];
 
@@ -102,11 +121,6 @@ function getArithPrefill(messages) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function getAvailableKeys() {
-  if (KEYS.length === 0) throw new Error('Aucune clé OpenRouter configurée.');
-  return KEYS;
-}
 
 function hasMultimodalContent(messages) {
   if (!Array.isArray(messages)) return false;
@@ -145,10 +159,10 @@ function convertToOpenAIFormat(messages) {
 // ─── Core fetch ───────────────────────────────────────────────────────────────
 
 async function openRouterFetch(options) {
-  const keys = getAvailableKeys();
-
   const tier      = options.model ?? 'opus';
   const maxTokens = options.max_tokens ?? MAX_TOKENS[tier] ?? 16_000;
+  // stream: true par défaut sauf si explicitement false
+  const useStream = options.stream !== false;
 
   const isMultimodal = hasMultimodalContent(options.messages ?? []);
 
@@ -156,90 +170,128 @@ async function openRouterFetch(options) {
     ? VISION_FALLBACK
     : (OPENROUTER_MODELS[tier] ?? OPENROUTER_MODELS.opus);
 
-  // Convertir le format si multimodal
   let messages = isMultimodal
-    ? convertToOpenAIFormat(options.messages)
-    : options.messages;
+    ? convertToOpenAIFormat(options.messages ?? [])
+    : (options.messages ?? []);
 
-  // ── Prefill arith-table ──────────────────────────────────────────────────
-  const prefill = isMultimodal ? null : getArithPrefill(messages);
+  // ── Prefill arith-table (seulement en mode stream, pas multimodal) ──────
+  const prefill = (isMultimodal || !useStream) ? null : getArithPrefill(messages);
 
   if (prefill) {
     messages = [...messages, { role: 'assistant', content: prefill }];
   }
 
-  console.log(
-    `[OpenRouter] model=${model} | prefill=${prefill ? 'oui' : 'non'} | multimodal=${isMultimodal} | max_tokens=${maxTokens} | messages=${messages.length}`
-  );
+  // ── Round-robin : essayer chaque clé jusqu'à succès ─────────────────────
+  const keys = getAvailableKeys();
+  let lastError = null;
 
-  // ── Appel API ────────────────────────────────────────────────────────────
-  const res = await fetch(BASE_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'Authorization': `Bearer ${keys[0]}`,
-      'HTTP-Referer':  'https://nerosia.app',
-      'X-Title':       'Nerosia',
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      max_tokens:  maxTokens,
-      temperature: options.temperature ?? 0.7,
-      stream:      true,
-    }),
-  });
+  for (let attempt = 0; attempt < keys.length; attempt++) {
+    const key = getNextKey();
 
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message ?? `Erreur HTTP ${res.status}`);
-  }
+    console.log(
+      `[OpenRouter] model=${model} | prefill=${prefill ? 'oui' : 'non'} | multimodal=${isMultimodal} | stream=${useStream} | max_tokens=${maxTokens} | key=...${key.slice(-6)} | attempt=${attempt + 1}/${keys.length}`
+    );
 
-  // ── Lecture du stream SSE ────────────────────────────────────────────────
-  let content   = '';
-  let reasoning = '';
+    let res;
+    try {
+      res = await fetch(BASE_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': `Bearer ${key}`,
+          'HTTP-Referer':  'https://nerosia.app',
+          'X-Title':       'Nerosia',
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          max_tokens:  maxTokens,
+          temperature: options.temperature ?? 0.7,
+          stream:      useStream,
+        }),
+      });
+    } catch (fetchErr) {
+      console.warn(`[OpenRouter] Fetch réseau échoué (clé ...${key.slice(-6)}):`, fetchErr.message);
+      lastError = fetchErr;
+      continue; // essayer la clé suivante
+    }
 
-  const reader  = res.body.getReader();
-  const decoder = new TextDecoder();
+    // Retry sur 429 (quota) ou 5xx (erreur serveur transitoire)
+    if (res.status === 429 || res.status >= 500) {
+      const body = await res.json().catch(() => ({}));
+      console.warn(`[OpenRouter] HTTP ${res.status} (clé ...${key.slice(-6)}):`, body?.error?.message ?? '');
+      lastError = new Error(body?.error?.message ?? `Erreur HTTP ${res.status}`);
+      continue; // essayer la clé suivante
+    }
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err?.error?.message ?? `Erreur HTTP ${res.status}`);
+    }
 
-    const lines = decoder
-      .decode(value, { stream: true })
-      .split('\n')
-      .filter(l => l.startsWith('data: '));
+    // ── Mode NON-stream (ex: rephraseForSearch) ────────────────────────────
+    if (!useStream) {
+      const data = await res.json();
+      const rawContent = data.choices?.[0]?.message?.content ?? '';
+      return { content: rawContent, reasoning: '', modelUsed: model };
+    }
 
-    for (const line of lines) {
-      const payload = line.slice(6).trim();
-      if (payload === '[DONE]') continue;
+    // ── Mode stream ────────────────────────────────────────────────────────
+    if (!res.body) {
+      throw new Error('[OpenRouter] res.body est null — stream impossible');
+    }
 
-      try {
-        const { choices } = JSON.parse(payload);
-        const delta = choices?.[0]?.delta;
+    let content   = '';
+    let reasoning = '';
 
-        if (delta?.content) {
-          content += delta.content;
-          options.onChunk?.(content);
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const lines = decoder
+        .decode(value, { stream: true })
+        .split('\n')
+        .filter(l => l.startsWith('data: '));
+
+      for (const line of lines) {
+        const payload = line.slice(6).trim();
+        if (payload === '[DONE]') continue;
+
+        try {
+          const { choices } = JSON.parse(payload);
+          const delta = choices?.[0]?.delta;
+
+          if (delta?.content) {
+            content += delta.content;
+            // ← on passe delta.content (le nouveau morceau uniquement),
+            //   pas `content` cumulé, pour que le caller puisse streamer
+            //   correctement sans dupliquer le texte.
+            options.onChunk?.(delta.content);
+          }
+          if (delta?.reasoning) {
+            reasoning += delta.reasoning;
+          }
+        } catch {
+          // chunk malformé → on ignore
         }
-        if (delta?.reasoning) {
-          reasoning += delta.reasoning;
-        }
-      } catch {
-        // chunk malformé → on ignore
       }
     }
+
+    // ── Recoller le prefill si OpenRouter ne le répète pas ─────────────────
+    // Vérification défensive : si le stream a déjà inclus le prefill,
+    // ne pas le dupliquer.
+    const finalContent = prefill
+      ? (content.startsWith(prefill) ? content : prefill + content)
+      : content;
+
+    return { content: finalContent, reasoning, modelUsed: model };
   }
 
-  // ── Recoller le prefill si OpenRouter ne le répète pas ──────────────────
-  // OpenRouter n'inclut PAS le message assistant prefill dans le stream,
-  // donc on le recolle toujours en tête du contenu final.
-  const finalContent = prefill
-    ? prefill + content
-    : content;
-
-  return { content: finalContent, reasoning, modelUsed: model };
+  // Toutes les clés ont échoué
+  throw lastError ?? new Error('[OpenRouter] Toutes les clés ont échoué.');
 }
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
