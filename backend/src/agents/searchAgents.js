@@ -2,72 +2,91 @@ const { openRouterFetch } = require('../openrouter');
 
 const SERPER_API_KEY = process.env.SERPER_KEY;
 
-const ACADEMIC_KW  = ['étude','recherche','article scientifique','papier','pubmed','arxiv','thèse','journal','académique','publication','scientifique','selon les études','recherches montrent','science','preuve'];
-const IMAGE_KW     = ['image','photo','illustration','montre','à quoi ressemble','voir une photo','schéma','visuel','montre moi','photos de','images de'];
-const WIKIPEDIA_KW = ['wikipedia','définition',"c'est quoi",'kesako','histoire de','biographie','origine de',"qu'est-ce que","qu'est ce que",'signifie','veut dire'];
-const REDDIT_KW    = ['reddit','expérience','forum','communauté','gens pensent',"retour d'expérience",'témoignage','que pensent les gens','avis reddit','opinion reddit','avis des gens'];
+const ACADEMIC_KW  = ['étude','etude','recherche','article scientifique','papier','pubmed','arxiv','thèse','these','journal','académique','academique','publication','scientifique','selon les études','selon les etudes','recherches montrent','science','preuve'];
+const IMAGE_KW     = ['image','photo','illustration','montre','à quoi ressemble','a quoi ressemble','voir une photo','schéma','schema','visuel','montre moi','photos de','images de'];
+const WIKIPEDIA_KW = ['wikipedia','définition','definition',"c'est quoi",'kesako','histoire de','biographie','origine de',"qu'est-ce que","qu'est ce que",'signifie','veut dire'];
+const REDDIT_KW    = ['reddit','expérience','experience','forum','communauté','communaute','gens pensent',"retour d'expérience","retour d'experience",'témoignage','temoignage','que pensent les gens','avis reddit','opinion reddit','avis des gens'];
 
 // ── Catégories où les images N'apportent RIEN ─────────────────────────────────
 const NO_IMAGE_KW = [
-  'équation','inéquation','discriminant','racine','polynôme','dérivée',
-  'intégrale','limite','matrice','trinôme','binôme','factori',
-  'développer','simplifier','résoudre','calculer','démontrer','prouver',
-  'tableau de signes','tableau de valeurs','ensemble de définition',
+  'équation','equation','inéquation','inequation','discriminant','racine','polynôme','polynome','dérivée','derivee',
+  'intégrale','integrale','limite','matrice','trinôme','trinome','binôme','binome','factori',
+  'développer','developper','simplifier','résoudre','resoudre','calculer','démontrer','demontrer','prouver',
+  'tableau de signes','tableau de valeurs','ensemble de définition','ensemble de definition',
   'code','programme','script','fonction','algorithme','bug','erreur','debug',
   'api','backend','frontend','react','python','javascript','typescript',
   'html','css','sql','nodejs','express','composant',
-  'dissertation','plan dialectique','thèse','antithèse','synthèse',
-  'argumentation','commenter','rédige','introduction','conclusion',
+  'dissertation','plan dialectique','thèse','these','antithèse','antithese','synthèse','synthese',
+  'argumentation','commenter','rédige','redige','introduction','conclusion',
   'signifie','veut dire','expliquer','pourquoi','comment',
   'loi de','formule','calculer la force','calculer la vitesse',
 ];
 
 // ── Catégories où les images ont de la valeur ─────────────────────────────────
 const YES_IMAGE_KW = [
-  'qui est','biographie','portrait','président','roi','reine','fondateur',
+  'qui est','biographie','portrait','président','president','roi','reine','fondateur',
   'inventeur','scientifique','artiste','acteur','chanteur','musicien',
-  'joueur','athlète','politicien','philosophe','écrivain','auteur',
-  'pays','ville','capitale','monument','bâtiment','tour','pont','fleuve',
-  'montagne','continent','carte','région','quartier','musée','cathédrale',
-  'animal','espèce','plante','fleur','arbre','insecte','oiseau','poisson',
-  'mammifère','reptile','paysage','nature','forêt','océan','désert',
-  'voiture','téléphone','appareil','machine','outil','instrument',
-  'produit','objet','œuvre','tableau','sculpture','architecture',
-  'événement','catastrophe','manifestation','inauguration','lancement',
-  'match','compétition','cérémonie','festival','exposition',
+  'joueur','athlète','athlete','politicien','philosophe','écrivain','ecrivain','auteur',
+  'pays','ville','capitale','monument','bâtiment','batiment','tour','pont','fleuve',
+  'montagne','continent','carte','région','region','quartier','musée','musee','cathédrale','cathedrale',
+  'animal','espèce','espece','plante','fleur','arbre','insecte','oiseau','poisson',
+  'mammifère','mammifere','reptile','paysage','nature','forêt','foret','océan','ocean','désert','desert',
+  'voiture','téléphone','telephone','appareil','machine','outil','instrument',
+  'produit','objet','œuvre','oeuvre','tableau','sculpture','architecture',
+  'événement','evenement','catastrophe','manifestation','inauguration','lancement',
+  'match','compétition','competition','cérémonie','ceremonie','festival','exposition',
 ];
+
+const VALID_AGENTS = ['web', 'image', 'academic', 'reddit', 'wikipedia'];
+
+// ── Normalise une string (minuscules + sans accents) ──────────────────────────
+function normalize(str) {
+  return str.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
 
 function hasProperNoun(query) {
   return /[A-ZÀÂÉÈÊËÎÏÔÙÛÜ][a-zàâéèêëîïôùûü]+ [A-ZÀÂÉÈÊËÎÏÔÙÛÜ][a-zàâéèêëîïôùûü]+/.test(query);
 }
 
+// ── detectAgent utilise maintenant la même normalisation que detectImageIntent ─
 function detectAgent(query) {
-  const q = query.toLowerCase();
-  if (IMAGE_KW.some(k => q.includes(k)))     return 'image';
-  if (ACADEMIC_KW.some(k => q.includes(k)))  return 'academic';
-  if (REDDIT_KW.some(k => q.includes(k)))    return 'reddit';
-  if (WIKIPEDIA_KW.some(k => q.includes(k))) return 'wikipedia';
+  const q = normalize(query);
+  if (IMAGE_KW.some(k => q.includes(normalize(k))))     return 'image';
+  if (ACADEMIC_KW.some(k => q.includes(normalize(k))))  return 'academic';
+  if (REDDIT_KW.some(k => q.includes(normalize(k))))    return 'reddit';
+  if (WIKIPEDIA_KW.some(k => q.includes(normalize(k)))) return 'wikipedia';
   return 'web';
 }
 
-// ── Décide si les images sont pertinentes pour cette question ─────────────────
 function detectImageIntent(query) {
-  const q = query.toLowerCase()
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-
-  // Veto explicite : question abstraite/formelle → jamais d'images
-  if (NO_IMAGE_KW.some(kw => q.includes(kw))) return 'none';
-
-  // Signal positif : sujet visuel confirmé
-  if (YES_IMAGE_KW.some(kw => q.includes(kw))) return 'show';
-
-  // Agent image explicite
-  if (IMAGE_KW.some(kw => q.includes(kw))) return 'show';
-
-  // Par défaut : pas d'images
+  const q = normalize(query);
+  if (NO_IMAGE_KW.some(kw => q.includes(normalize(kw))))  return 'none';
+  if (YES_IMAGE_KW.some(kw => q.includes(normalize(kw)))) return 'show';
+  if (IMAGE_KW.some(kw => q.includes(normalize(kw))))     return 'show';
   return 'none';
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function safeTimeout(ms) {
+  // AbortSignal.timeout() requiert Node >= 17.3
+  // On vérifie la disponibilité avant d'utiliser
+  if (typeof AbortSignal?.timeout === 'function') {
+    return AbortSignal.timeout(ms);
+  }
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), ms);
+  return controller.signal;
+}
+
+function safeFavicon(link) {
+  try {
+    return `https://www.google.com/s2/favicons?sz=64&domain=${new URL(link).hostname}`;
+  } catch {
+    return undefined;
+  }
+}
+
+// ── rephraseForSearch ─────────────────────────────────────────────────────────
 async function rephraseForSearch(query, lang = 'français') {
   if (hasProperNoun(query)) {
     console.log('[rephraseForSearch] Nom propre détecté — requête conservée telle quelle');
@@ -83,7 +102,19 @@ async function rephraseForSearch(query, lang = 'français') {
         { role: 'user', content: query },
       ],
     });
-    const result = r.content.trim().replace(/^["']|["']$/g, '').replace(/\.$/, '');
+
+    // r.content peut être un array OpenRouter ou une string selon openRouterFetch
+    let raw = '';
+    if (typeof r?.content === 'string') {
+      raw = r.content;
+    } else if (Array.isArray(r?.content)) {
+      raw = r.content.map(b => b?.text ?? '').join('');
+    } else {
+      console.warn('[rephraseForSearch] Format de réponse inattendu:', JSON.stringify(r));
+      return query;
+    }
+
+    const result = raw.trim().replace(/^["']|["']$/g, '').replace(/\.$/, '');
     return result.length > 3 ? result : query;
   } catch (err) {
     console.warn('[rephraseForSearch] LLM error:', err.message);
@@ -111,7 +142,7 @@ async function serperImageSearch(query) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-API-KEY': SERPER_API_KEY },
       body: JSON.stringify({ q: query, num: 8, hl: 'fr', gl: 'fr' }),
-      signal: AbortSignal.timeout(6000),
+      signal: safeTimeout(6000),
     });
     if (!res.ok) return [];
     const data = await res.json();
@@ -158,15 +189,22 @@ async function serperSearch(query) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-API-KEY': SERPER_API_KEY },
       body: JSON.stringify({ q: query, num: 8, hl: 'fr', gl: 'fr' }),
-      signal: AbortSignal.timeout(8000),
+      signal: safeTimeout(8000),
     });
     if (!res.ok) throw new Error(`Serper HTTP ${res.status}`);
     const data = await res.json();
     const sources = [];
 
     if (data.answerBox?.answer || data.answerBox?.snippet) {
-      sources.push({ title: data.answerBox.title ?? query, url: data.answerBox.link ?? '', snippet: data.answerBox.answer ?? data.answerBox.snippet, type: 'web', featured: true });
+      sources.push({
+        title:    data.answerBox.title ?? query,
+        url:      data.answerBox.link ?? '',
+        snippet:  data.answerBox.answer ?? data.answerBox.snippet,
+        type:     'web',
+        featured: true,
+      });
     }
+
     for (const r of (data.organic ?? [])) {
       sources.push({
         title:   r.title ?? '',
@@ -175,9 +213,10 @@ async function serperSearch(query) {
         img_src: r.imageUrl ?? undefined,
         type:    'web',
         date:    r.date ?? undefined,
-        favicon: `https://www.google.com/s2/favicons?sz=64&domain=${new URL(r.link).hostname}`,
+        favicon: safeFavicon(r.link), // ← fix crash new URL()
       });
     }
+
     return sources.filter(s => s.title && s.url).slice(0, 8);
   } catch (err) {
     console.warn('[WebAgent] Serper error:', err.message);
@@ -188,15 +227,25 @@ async function serperSearch(query) {
 async function duckduckgoInstantAnswer(query) {
   try {
     const encoded = encodeURIComponent(query);
-    const res = await fetch(`https://api.duckduckgo.com/?q=${encoded}&format=json&no_redirect=1&no_html=1&skip_disambig=1`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(6000) });
+    const res = await fetch(
+      `https://api.duckduckgo.com/?q=${encoded}&format=json&no_redirect=1&no_html=1&skip_disambig=1`,
+      { headers: { Accept: 'application/json' }, signal: safeTimeout(6000) }
+    );
     const data = await res.json();
     const sources = [];
-    if (data.AbstractText && data.AbstractURL) sources.push({ title: data.Heading || query, url: data.AbstractURL, snippet: data.AbstractText, type: 'web' });
+    if (data.AbstractText && data.AbstractURL) {
+      sources.push({ title: data.Heading || query, url: data.AbstractURL, snippet: data.AbstractText, type: 'web' });
+    }
     for (const t of (data.RelatedTopics ?? []).flatMap(t => t.Topics ? t.Topics : [t])) {
-      if (t.FirstURL && t.Text) sources.push({ title: t.Text.slice(0, 90), url: t.FirstURL, snippet: t.Text, type: 'web' });
+      if (t.FirstURL && t.Text) {
+        sources.push({ title: t.Text.slice(0, 90), url: t.FirstURL, snippet: t.Text, type: 'web' });
+      }
     }
     return sources.slice(0, 5);
-  } catch { return []; }
+  } catch (err) {
+    console.warn('[DuckDuckGo] error:', err.message); // ← plus de catch silencieux
+    return [];
+  }
 }
 
 // ── Agent Image ───────────────────────────────────────────────────────────────
@@ -223,11 +272,11 @@ async function wikimediaSearch(query) {
     const encoded = encodeURIComponent(query);
     const searchRes = await fetch(
       `https://commons.wikimedia.org/w/api.php?action=query&list=search&srsearch=${encoded}&srnamespace=6&srlimit=12&format=json&origin=*`,
-      { signal: AbortSignal.timeout(7000) }
+      { signal: safeTimeout(7000) }
     );
     if (!searchRes.ok) throw new Error(`Wikimedia ${searchRes.status}`);
     const searchData = await searchRes.json();
-    let titles = (searchData.query?.search ?? [])
+    const titles = (searchData.query?.search ?? [])
       .map(item => item.title)
       .filter(t => /\.(jpg|jpeg|png|gif|webp|svg)$/i.test(t));
 
@@ -236,7 +285,7 @@ async function wikimediaSearch(query) {
     const titlesParam = titles.slice(0, 8).join('|');
     const infoRes = await fetch(
       `https://commons.wikimedia.org/w/api.php?action=query&titles=${encodeURIComponent(titlesParam)}&prop=imageinfo&iiprop=url|thumburl|extmetadata&iiurlwidth=600&format=json&origin=*`,
-      { signal: AbortSignal.timeout(7000) }
+      { signal: safeTimeout(7000) }
     );
     if (!infoRes.ok) throw new Error(`Wikimedia info ${infoRes.status}`);
     const infoData = await infoRes.json();
@@ -257,22 +306,37 @@ async function wikimediaSearch(query) {
       .filter(s => s.img_src)
       .slice(0, 8);
   } catch (err) {
-    console.warn('[ImageAgent] error:', err.message);
+    console.warn('[ImageAgent] wikimediaSearch error:', err.message);
     return [];
   }
 }
 
+// ── Fix : utilise list=search au lieu de titles= ──────────────────────────────
 async function wikimediaFallbackFromWikipedia(query) {
   const sources = [];
   for (const lang of ['fr', 'en']) {
     try {
       const encoded = encodeURIComponent(query);
+
+      // Étape 1 : recherche textuelle pour trouver le bon titre de page
+      const searchRes = await fetch(
+        `https://${lang}.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encoded}&srlimit=3&format=json&origin=*`,
+        { signal: safeTimeout(6000) }
+      );
+      if (!searchRes.ok) continue;
+      const searchData = await searchRes.json();
+      const hits = searchData.query?.search ?? [];
+      if (hits.length === 0) continue;
+
+      // Étape 2 : récupère images + extrait sur les pages trouvées
+      const pageIds = hits.map(h => h.pageid).join('|');
       const res = await fetch(
-        `https://${lang}.wikipedia.org/w/api.php?action=query&titles=${encoded}&prop=pageimages|extracts|info&exintro=1&exchars=200&piprop=original|thumbnail&pithumbsize=600&inprop=url&format=json&origin=*`,
-        { signal: AbortSignal.timeout(6000) }
+        `https://${lang}.wikipedia.org/w/api.php?action=query&pageids=${pageIds}&prop=pageimages|extracts|info&exintro=1&exchars=200&piprop=original|thumbnail&pithumbsize=600&inprop=url&format=json&origin=*`,
+        { signal: safeTimeout(6000) }
       );
       if (!res.ok) continue;
       const data = await res.json();
+
       for (const page of Object.values(data.query?.pages ?? {})) {
         if (page.missing || (!page.thumbnail?.source && !page.original?.source)) continue;
         sources.push({
@@ -284,7 +348,9 @@ async function wikimediaFallbackFromWikipedia(query) {
         });
       }
       if (sources.length > 0) break;
-    } catch {}
+    } catch (err) {
+      console.warn(`[wikimediaFallback] ${lang} error:`, err.message);
+    }
   }
   return sources;
 }
@@ -312,7 +378,7 @@ async function semanticScholarSearch(query) {
     const encoded = encodeURIComponent(query);
     const res = await fetch(
       `https://api.semanticscholar.org/graph/v1/paper/search?query=${encoded}&limit=8&fields=title,abstract,year,authors,externalIds,openAccessPdf`,
-      { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(9000) }
+      { headers: { Accept: 'application/json' }, signal: safeTimeout(9000) }
     );
     if (!res.ok) throw new Error(`Semantic Scholar ${res.status}`);
     const data = await res.json();
@@ -333,7 +399,7 @@ async function semanticScholarSearch(query) {
       };
     }).filter(s => s.title && s.url);
   } catch (err) {
-    console.warn('[AcademicAgent] error:', err.message);
+    console.warn('[AcademicAgent] Semantic Scholar error:', err.message);
     return arxivSearch(query);
   }
 }
@@ -343,7 +409,7 @@ async function arxivSearch(query) {
     const encoded = encodeURIComponent(query);
     const res     = await fetch(
       `https://export.arxiv.org/api/query?search_query=all:${encoded}&max_results=6&sortBy=relevance`,
-      { signal: AbortSignal.timeout(9000) }
+      { signal: safeTimeout(9000) }
     );
     const text = await res.text();
     return (text.match(/<entry>([\s\S]*?)<\/entry>/g) ?? []).slice(0, 6).map(entry => {
@@ -351,7 +417,12 @@ async function arxivSearch(query) {
       const summary = entry.match(/<summary>([\s\S]*?)<\/summary>/)?.[1]?.trim().replace(/\s+/g, ' ') ?? '';
       const link    = entry.match(/<id>([\s\S]*?)<\/id>/)?.[1]?.trim() ?? '';
       const authors = [...entry.matchAll(/<name>([\s\S]*?)<\/name>/g)].slice(0, 2).map(m => m[1]).join(', ');
-      return { title, url: link.replace('http://', 'https://'), snippet: `${summary.slice(0, 200)}…${authors ? ` — ${authors}` : ''}`, type: 'academic' };
+      return {
+        title,
+        url:     link.replace('http://', 'https://'),
+        snippet: `${summary.slice(0, 200)}…${authors ? ` — ${authors}` : ''}`,
+        type:    'academic',
+      };
     }).filter(s => s.title && s.url);
   } catch (err) {
     console.warn('[AcademicAgent] arXiv error:', err.message);
@@ -382,7 +453,7 @@ async function redditSearch(query) {
     const encoded = encodeURIComponent(query);
     const res = await fetch(
       `https://www.reddit.com/search.json?q=${encoded}&sort=relevance&limit=8&t=year`,
-      { headers: { Accept: 'application/json', 'User-Agent': 'NerosiaMobileApp/1.0' }, signal: AbortSignal.timeout(7000) }
+      { headers: { Accept: 'application/json', 'User-Agent': 'NerosiaMobileApp/1.0' }, signal: safeTimeout(7000) }
     );
     if (!res.ok) throw new Error(`Reddit ${res.status}`);
     const data = await res.json();
@@ -434,7 +505,7 @@ async function wikipediaSearch(query) {
       const encoded   = encodeURIComponent(query);
       const searchRes = await fetch(
         `https://${lang}.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encoded}&srlimit=5&format=json&origin=*`,
-        { signal: AbortSignal.timeout(6000) }
+        { signal: safeTimeout(6000) }
       );
       if (!searchRes.ok) continue;
       const searchData = await searchRes.json();
@@ -444,7 +515,7 @@ async function wikipediaSearch(query) {
       const pageIds    = hits.slice(0, 4).map(h => h.pageid).join('|');
       const extractRes = await fetch(
         `https://${lang}.wikipedia.org/w/api.php?action=query&pageids=${pageIds}&prop=extracts|pageimages|info&exintro=1&exchars=300&piprop=thumbnail&pithumbsize=400&inprop=url&format=json&origin=*`,
-        { signal: AbortSignal.timeout(6000) }
+        { signal: safeTimeout(6000) }
       );
       if (!extractRes.ok) continue;
       const extractData = await extractRes.json();
@@ -469,14 +540,28 @@ async function wikipediaSearch(query) {
 
 // ── Export principal ──────────────────────────────────────────────────────────
 async function runSearchAgent(query, forceAgent) {
-  const agent = forceAgent ?? detectAgent(query);
-  switch (agent) {
-    case 'image':     return runImageAgent(query);
-    case 'academic':  return runAcademicAgent(query);
-    case 'reddit':    return runRedditAgent(query);
-    case 'wikipedia': return runWikipediaAgent(query);
-    case 'web':
-    default:          return runWebAgent(query);
+  // Validation query
+  if (!query || typeof query !== 'string') {
+    console.warn('[runSearchAgent] Query invalide:', query);
+    return { agent: 'web', sources: [], images: [], imageIntent: 'none', contextBlock: '', thinkingLabel: 'Erreur' };
+  }
+  const safeQuery = query.trim().slice(0, 500);
+
+  // Validation forceAgent — whitelist stricte
+  const agent = VALID_AGENTS.includes(forceAgent) ? forceAgent : detectAgent(safeQuery);
+
+  try {
+    switch (agent) {
+      case 'image':     return await runImageAgent(safeQuery);
+      case 'academic':  return await runAcademicAgent(safeQuery);
+      case 'reddit':    return await runRedditAgent(safeQuery);
+      case 'wikipedia': return await runWikipediaAgent(safeQuery);
+      case 'web':
+      default:          return await runWebAgent(safeQuery);
+    }
+  } catch (err) {
+    console.error('[runSearchAgent] Erreur non catchée dans agent:', agent, err.message);
+    return { agent, sources: [], images: [], imageIntent: 'none', contextBlock: '', thinkingLabel: 'Erreur' };
   }
 }
 
