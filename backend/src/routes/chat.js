@@ -22,7 +22,7 @@ const LIMITS = {
   MESSAGE_MAX_LENGTH:    20_000,
   MAX_ATTACHMENTS:       5,
   MAX_TOKENS_CAP:        8_192,
-  MAX_BASE64_SIZE_BYTES: 10 * 1024 * 1024, // 10 Mo par pièce jointe
+  MAX_BASE64_SIZE_BYTES: 10 * 1024 * 1024,
   TEMPERATURE_MIN:       0,
   TEMPERATURE_MAX:       1,
 };
@@ -67,10 +67,10 @@ function validateInputs(message, attachments, max_tokens, temperature) {
       return `temperature doit être entre ${LIMITS.TEMPERATURE_MIN} et ${LIMITS.TEMPERATURE_MAX}`;
     }
   }
-  return null; // OK
+  return null;
 }
 
-// ── Résolution du type de pièce jointe depuis le mimeType (côté serveur) ─────
+// ── Résolution du type de pièce jointe ───────────────────────────────────────
 
 function resolveAttachmentType(att) {
   if (!att.mimeType) return null;
@@ -80,11 +80,11 @@ function resolveAttachmentType(att) {
 
   if (['application/octet-stream', 'application/x-unknown', ''].includes(mime)) {
     const name = att.name?.toLowerCase() ?? '';
-    if (name.endsWith('.pdf'))                          mime = 'application/pdf';
+    if (name.endsWith('.pdf'))                                mime = 'application/pdf';
     else if (name.endsWith('.jpg') || name.endsWith('.jpeg')) mime = 'image/jpeg';
-    else if (name.endsWith('.png'))                     mime = 'image/png';
-    else if (name.endsWith('.gif'))                     mime = 'image/gif';
-    else if (name.endsWith('.webp'))                    mime = 'image/webp';
+    else if (name.endsWith('.png'))                           mime = 'image/png';
+    else if (name.endsWith('.gif'))                           mime = 'image/gif';
+    else if (name.endsWith('.webp'))                          mime = 'image/webp';
     else return null;
   }
 
@@ -131,9 +131,22 @@ function buildUserContent(message, attachments = []) {
   return blocks;
 }
 
+// ── Détection requête code (pas de recherche web pour le code) ────────────────
+// FIX: les requêtes de code ne doivent pas déclencher runSearchAgent
+// car ça bloque l'UI pendant toute la durée de la recherche sans feedback
+
+const CODE_QUERY_PATTERNS = [
+  /\b(code|programme|script|fonction|algorithme|debug|debugg|api|react|python|javascript|typescript|html|css|sql|nodejs|node\.js|express|composant|component)\b/i,
+  /\b(crée|génère|écris|développe|implémente|fais|rédige|refactor|corrige|fixe|améliore).{0,40}\b(application|app|site|web|composant|component|api|backend|frontend|serveur|server|fonction|function|classe|class|module)\b/i,
+  /\b(bug|erreur|error|exception|crash|segfault|stacktrace|stack trace)\b/i,
+];
+
+function isCodeQuery(query) {
+  if (!query || typeof query !== 'string') return false;
+  return CODE_QUERY_PATTERNS.some(re => re.test(query));
+}
+
 // ── Détection de la nécessité d'une recherche web ────────────────────────────
-// Alignée avec searchRouter.js : normalisation des accents pour éviter
-// les incohérences entre les deux fichiers.
 
 const NO_SEARCH_PATTERNS = [
   /^(bonjour|salut|hello|hi|hey|bonsoir|coucou)\b/i,
@@ -154,6 +167,8 @@ function needsSearch(query) {
   const q     = query.trim();
   const qNorm = normalize(q);
   if (q.length < 8) return false;
+  // FIX: pas de recherche pour les requêtes code — ça bloque l'UI inutilement
+  if (isCodeQuery(q)) return false;
   return !NO_SEARCH_PATTERNS.some(re => re.test(q) || re.test(qNorm));
 }
 
@@ -201,17 +216,24 @@ function parseStepsFromPartial(partial) {
 }
 
 // ── Nettoyage du contenu affiché (retire les balises <thinking>) ──────────────
+// FIX: robuste sur tags partiels, insensible à la casse, gère aussi </thinking>
 
 function stripThinking(content) {
-  if (content.includes('</thinking>')) {
+  if (!content) return content;
+
+  // Tags complets (toutes variantes)
+  if (/<\/thinking>/i.test(content)) {
     return content
-      .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
+      .replace(/<thinking>[\s\S]*?<\/thinking>\s*/gi, '')
       .trimStart();
   }
-  const idx = content.indexOf('<thinking>');
+
+  // Tag ouvert non fermé → couper à partir de là
+  const idx = content.search(/<thinking>/i);
   if (idx !== -1) {
     return content.slice(0, idx).trimEnd();
   }
+
   return content;
 }
 
@@ -265,11 +287,9 @@ router.post('/', async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  // ── Guard : send() et done() sûrs même après déconnexion client ───────────
   let isDone = false;
 
   const send = (data) => {
-    // ← FIX : vérifier que la connexion est encore ouverte avant d'écrire
     if (isDone || res.writableEnded || res.destroyed) return;
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
@@ -283,7 +303,6 @@ router.post('/', async (req, res) => {
     }
   };
 
-  // ── Helper : construction des messages history ────────────────────────────
   const VALID_ROLES = new Set(['user', 'assistant']);
 
   function buildHistory() {
@@ -306,8 +325,6 @@ router.post('/', async (req, res) => {
 
     // ── 1. Pipeline code (deep research) ──────────────────────────────────────
     if (deepResearch && needsCodePipeline(message)) {
-      // ← FIX : await/then antipattern remplacé par await direct
-      // done() est garanti même si runCodePipeline throw
       const result = await runCodePipeline(message, (agentSteps) => {
         send({ type: 'pipeline', steps: agentSteps });
       });
@@ -338,12 +355,16 @@ router.post('/', async (req, res) => {
     }
 
     // ── 3. Recherche web ───────────────────────────────────────────────────────
+    // FIX: needsSearch retourne false pour les requêtes code → pas de blocage
     let systemContext = '';
     let sources       = [];
 
-    // ← FIX : suppression du check redondant `message.trim().length >= 8`
-    //   (needsSearch le vérifie déjà en interne)
     if (needsSearch(message)) {
+      // FIX: envoyer un thinkingStep immédiatement pour que l'UI ne soit pas bloquée
+      send({
+        type:  'thinkingSteps',
+        steps: [{ label: 'Recherche en cours…', icon: 'globe', done: false }],
+      });
       send({ type: 'searching', status: 'loading', label: 'Recherche en cours…', icon: 'globe' });
 
       try {
@@ -384,10 +405,11 @@ router.post('/', async (req, res) => {
     ];
 
     // ── 5. Appel LLM ──────────────────────────────────────────────────────────
-    // streamedContent accumule le texte complet reçu chunk par chunk.
-    // openRouterFetch passe maintenant le DELTA (nouveau morceau seulement)
-    // dans onChunk → on accumule avec +=, pas =.
     let streamedContent = '';
+
+    // FIX: flag pour n'envoyer le contenu "avant <thinking>" qu'une seule fois
+    // L'ancien code renvoyait `before` à chaque chunk → duplication côté client
+    let thinkingStartSent = false;
 
     const result = await openRouterFetch({
       model:       resolvedModel,
@@ -396,20 +418,22 @@ router.post('/', async (req, res) => {
       messages,
 
       onChunk: (chunk) => {
-        // ← FIX : += pour accumuler le delta, au lieu de = qui écrasait
         streamedContent += chunk;
 
-        const hasOpen  = streamedContent.includes('<thinking>');
-        const hasClose = streamedContent.includes('</thinking>');
+        const hasOpen  = /<thinking>/i.test(streamedContent);
+        const hasClose = /<\/thinking>/i.test(streamedContent);
 
-        // Thinking en cours : envoyer ce qui précède + étapes partielles
+        // Thinking en cours (tag ouvert, pas encore fermé)
         if (hasOpen && !hasClose) {
-          const before = streamedContent
-            .slice(0, streamedContent.indexOf('<thinking>'))
-            .trimEnd();
-          if (before) send({ type: 'chunk', content: before });
+          if (!thinkingStartSent) {
+            // FIX: envoyer "before" une seule fois, pas à chaque chunk
+            thinkingStartSent = true;
+            const openIdx = streamedContent.search(/<thinking>/i);
+            const before  = streamedContent.slice(0, openIdx).trimEnd();
+            if (before) send({ type: 'chunk', content: before });
+          }
 
-          const partial = streamedContent.split('<thinking>')[1] ?? '';
+          const partial = streamedContent.split(/<thinking>/i)[1] ?? '';
           const steps   = parseStepsFromPartial(partial);
           if (steps.length > 0) {
             send({
@@ -422,7 +446,8 @@ router.post('/', async (req, res) => {
 
         // Thinking fermé : envoyer les étapes finales
         if (hasOpen && hasClose) {
-          const partial = streamedContent.split('<thinking>')[1]?.split('</thinking>')[0] ?? '';
+          const parts   = streamedContent.split(/<thinking>/i);
+          const partial = (parts[1] ?? '').split(/<\/thinking>/i)[0] ?? '';
           const steps   = parseStepsFromPartial(partial);
           if (steps.length > 0) {
             send({
@@ -432,14 +457,11 @@ router.post('/', async (req, res) => {
           }
         }
 
+        // Envoyer le contenu nettoyé (sans balises thinking)
         const displayContent = stripThinking(streamedContent);
         if (displayContent) send({ type: 'chunk', content: displayContent });
       },
     });
-
-    // ← FIX : "flush final garanti" supprimé — c'était un doublon exact du
-    //   dernier appel onChunk. Le frontend recevait le contenu complet deux fois.
-    //   onChunk gère déjà tous les cas (thinking ouvert, fermé, absent).
 
     send({ type: 'done', modelUsed: result.modelUsed });
     done();
