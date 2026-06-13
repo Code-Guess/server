@@ -9,7 +9,24 @@ const { getAvailableKeys, OPENROUTER_MODELS } = require('../openrouter');
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-const MAX_TOOL_ROUNDS = 10;
+const MAX_TOOL_ROUNDS = 5; // réduit pour rester sous le timeout 120s (5 × ~20s = 100s max)
+const IS_PROD         = process.env.NODE_ENV === 'production';
+
+// ─── Whitelist packages autorisés ────────────────────────────────────────────
+// Sécurité : le LLM ne peut installer que des packages de cette liste.
+// Ajoute ici les packages dont tu as besoin.
+
+const ALLOWED_PACKAGES = new Set([
+  // Python
+  'numpy', 'pandas', 'matplotlib', 'scipy', 'scikit-learn',
+  'requests', 'pillow', 'flask', 'fastapi', 'uvicorn',
+  'sqlalchemy', 'pydantic', 'httpx', 'beautifulsoup4', 'lxml',
+  // Node
+  'lodash', 'axios', 'express', 'dotenv', 'dayjs', 'uuid',
+  'zod', 'chalk', 'commander', 'fs-extra', 'csv-parser',
+]);
+
+const KNOWN_TOOLS = new Set(['execute_code', 'install_package', 'edit_file']);
 
 // ─── Patterns déclencheurs ────────────────────────────────────────────────────
 
@@ -72,11 +89,40 @@ function mergeToolCallDeltas(toolCallsAcc) {
     }));
 }
 
+// ─── Rotation des clés API ────────────────────────────────────────────────────
+// FIX : on ne prend plus toujours [0] — on tourne sur les clés disponibles
+// pour éviter qu'une clé épuisée bloque tous les appels.
+
+let keyIndex = 0;
+
+function getNextApiKey() {
+  const keys = getAvailableKeys();
+  if (!keys || keys.length === 0) {
+    throw new Error('Aucune clé OpenRouter disponible');
+  }
+  const key = keys[keyIndex % keys.length];
+  keyIndex   = (keyIndex + 1) % keys.length;
+  return key;
+}
+
+// ─── Extraction sécurisée du message texte ───────────────────────────────────
+// FIX : content peut être un tableau de blocs (pièces jointes) ou une string.
+// Dans les deux cas on extrait le texte proprement.
+
+function extractTextContent(content) {
+  if (!content) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.find(b => b.type === 'text')?.text ?? '';
+  }
+  return '';
+}
+
 // ─── Appel LLM (streaming) ────────────────────────────────────────────────────
 
 async function callModel({ res, messages, tier, max_tokens, temperature, streamText = false }) {
   const model  = resolveModel(tier);
-  const apiKey = getAvailableKeys()[0];
+  const apiKey = getNextApiKey(); // FIX : rotation au lieu de toujours [0]
 
   const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
@@ -143,9 +189,6 @@ async function callModel({ res, messages, tier, max_tokens, temperature, streamT
 }
 
 // ─── Phase 1 : Analyse + Plan ─────────────────────────────────────────────────
-// FIX : heartbeat SSE toutes les 3 secondes pendant l'attente LLM.
-// Sans ça, l'utilisateur voit le spinner "Réflexion en cours…" figé pendant
-// 10-20s sans aucun retour — le client croit que le serveur est mort.
 
 const PLAN_SYSTEM = `Tu es un assistant expert en développement logiciel.
 Quand l'utilisateur te demande de créer un projet ou du code, tu réponds UNIQUEMENT avec un JSON structuré (sans markdown) :
@@ -168,8 +211,6 @@ async function runPlanPhase({ res, userMessage, history, tier, temperature }) {
     thinking: { label: 'Analyse de votre demande…', icon: 'search', done: false },
   });
 
-  // FIX : heartbeat toutes les 3s pour montrer que le serveur travaille.
-  // Sans ça, 15-20s de silence côté client → l'utilisateur pense à un freeze.
   const heartbeatLabels = [
     'Analyse de votre demande…',
     'Lecture du contexte…',
@@ -191,7 +232,7 @@ async function runPlanPhase({ res, userMessage, history, tier, temperature }) {
       res,
       messages: [
         { role: 'system', content: PLAN_SYSTEM },
-        ...history.slice(-4),
+        ...history.slice(-6), // FIX : aligné avec runCreatePhase (était -4)
         { role: 'user', content: userMessage },
       ],
       tier: tier === 'opus' ? 'opus' : 'sonnet',
@@ -220,9 +261,6 @@ async function runPlanPhase({ res, userMessage, history, tier, temperature }) {
 }
 
 // ─── Phase 2 : Création (boucle agent avec tools) ─────────────────────────────
-// FIX : streamText passe à true pour que le client voie le code arriver
-// token par token pendant la génération. Avant : callModel bloquait tout
-// le temps de génération (pouvait durer 20-40s) sans rien envoyer au client.
 
 async function runCreatePhase({ res, userMessage, history, tier, plan, max_tokens, temperature }) {
   const systemPrompt = getSystemPrompt(userMessage, undefined);
@@ -260,9 +298,6 @@ async function runCreatePhase({ res, userMessage, history, tier, plan, max_token
   while (roundCount < MAX_TOOL_ROUNDS) {
     roundCount++;
 
-    // FIX : streamText: true — le contenu textuel (explication du modèle,
-    // blocs de code markdown) est streamé en temps réel via SSE type:'chunk'.
-    // Avant : streamText: false bloquait tout jusqu'à la fin du round LLM.
     const { content, toolCalls } = await callModel({
       res, messages, tier, max_tokens, temperature, streamText: true,
     });
@@ -273,11 +308,13 @@ async function runCreatePhase({ res, userMessage, history, tier, plan, max_token
 
     // Extraction des fichiers depuis les blocs de code markdown
     if (content) {
+      let matchIndex = 0;
       for (const m of content.matchAll(/```([^\n`]+)\n([\s\S]*?)```/g)) {
         const lang = m[1].trim().toLowerCase();
         const code = m[2];
 
-        const precedingText = content.slice(0, content.indexOf(m[0]));
+        // FIX : utilise m.index au lieu de indexOf pour éviter la mauvaise occurrence
+        const precedingText = content.slice(0, m.index);
         const nameMatch = precedingText.match(
           /(?:fichier|file|créer?|écrire?|voici|`)\s*[`"]?([^\s`"']+\.[a-zA-Z0-9]+)[`"]?\s*(?::|–|-)?/i
         );
@@ -299,16 +336,25 @@ async function runCreatePhase({ res, userMessage, history, tier, plan, max_token
           },
           file: { filename, language: lang, content: code },
         });
+
+        matchIndex++;
       }
     }
 
     if (toolCalls.length === 0) break;
 
     for (const tc of toolCalls) {
+
+      // FIX : valider le nom du tool avant de traiter
+      if (!KNOWN_TOOLS.has(tc.function.name)) {
+        console.warn('[agentLoop] Tool inconnu ignoré :', tc.function.name);
+        continue;
+      }
+
       let args = {};
       try { args = JSON.parse(tc.function.arguments); } catch {}
 
-      // ── execute_code ────────────────────────────────────────────────────
+      // ── execute_code ──────────────────────────────────────────────────────
       if (tc.function.name === 'execute_code') {
         const lang = args.language    ?? 'python';
         const desc = args.description ?? `Exécution ${lang}`;
@@ -357,10 +403,23 @@ async function runCreatePhase({ res, userMessage, history, tier, plan, max_token
           }),
         });
 
-      // ── install_package ─────────────────────────────────────────────────
+      // ── install_package ───────────────────────────────────────────────────
       } else if (tc.function.name === 'install_package') {
-        const pkgName = args.package ?? '';
+        const pkgName = (args.package ?? '').trim().toLowerCase();
         const mgr     = args.manager ?? 'pip';
+
+        // FIX : whitelist — on refuse tout package non autorisé
+        if (!ALLOWED_PACKAGES.has(pkgName)) {
+          console.warn('[agentLoop] Package refusé (hors whitelist) :', pkgName);
+          messages.push({
+            role: 'tool', tool_call_id: tc.id,
+            content: JSON.stringify({
+              status: 'error',
+              error:  `Package "${pkgName}" non autorisé. Utilise uniquement les packages approuvés.`,
+            }),
+          });
+          continue;
+        }
 
         sendSSE(res, {
           type: 'tool_step',
@@ -388,7 +447,7 @@ async function runCreatePhase({ res, userMessage, history, tier, plan, max_token
           }),
         });
 
-      // ── edit_file ───────────────────────────────────────────────────────
+      // ── edit_file ─────────────────────────────────────────────────────────
       } else if (tc.function.name === 'edit_file') {
         sendSSE(res, {
           type: 'tool_step',
@@ -401,7 +460,8 @@ async function runCreatePhase({ res, userMessage, history, tier, plan, max_token
 
         const existing = createdFiles.get(args.filename);
         if (existing && args.old_str && args.new_str) {
-          existing.content = existing.content.replace(args.old_str, args.new_str);
+          // FIX : replace toutes les occurrences, pas juste la première
+          existing.content = existing.content.split(args.old_str).join(args.new_str);
           createdFiles.set(args.filename, existing);
         }
 
@@ -424,17 +484,22 @@ async function runSummaryPhase({ res, plan, createdFiles, messages, tier, temper
     thinking: { label: 'Finalisation et résumé…', icon: 'presentation', done: false },
   });
 
+  // FIX : extraire le system prompt explicitement au lieu de slice(0,1)
+  const systemMsg = messages.find(m => m.role === 'system');
+
+  // FIX : streamText: false — le contenu est déjà renvoyé dans l'event 'done'
+  // sinon le résumé s'affiche deux fois côté client
   const { content: summary } = await callModel({
     res,
     messages: [
-      ...messages.slice(0, 1),
+      ...(systemMsg ? [systemMsg] : []),
       {
         role: 'user',
         content: `Le projet "${plan.summary}" est terminé. Donne un résumé court et clair (3-5 lignes) : ce qui a été créé, comment l'utiliser, les points importants. Sois concis et direct.`,
       },
     ],
     tier: tier === 'opus' ? 'opus' : 'sonnet',
-    max_tokens: 512, temperature, streamText: true,
+    max_tokens: 512, temperature, streamText: false,
   });
 
   const fileCount = createdFiles.length;
@@ -445,7 +510,7 @@ async function runSummaryPhase({ res, plan, createdFiles, messages, tier, temper
       icon: 'presentation', done: true,
     },
     files: createdFiles.map((f, i) => ({
-      id: `af_${i}_${f.filename}`,
+      id:       `af_${i}_${f.filename}`,
       filename: f.filename,
       language: f.language,
       content:  f.content,
@@ -460,9 +525,11 @@ async function runSummaryPhase({ res, plan, createdFiles, messages, tier, temper
 // ─── Point d'entrée principal ─────────────────────────────────────────────────
 
 async function runAgentLoop({ res, messages, model, max_tokens, temperature }) {
-  const userMsgs    = messages.filter(m => m.role !== 'system');
-  const lastUser    = [...userMsgs].reverse().find(m => m.role === 'user');
-  const userMessage = lastUser?.content ?? '';
+  const userMsgs = messages.filter(m => m.role !== 'system');
+  const lastUser = [...userMsgs].reverse().find(m => m.role === 'user');
+
+  // FIX : content peut être un tableau (pièces jointes) → extraire le texte proprement
+  const userMessage = extractTextContent(lastUser?.content);
   const history     = userMsgs.slice(0, -1);
   const tier        = model;
 
@@ -481,11 +548,15 @@ async function runAgentLoop({ res, messages, model, max_tokens, temperature }) {
 
   } catch (err) {
     console.error('[agentLoop] Erreur :', err.message);
+
+    // FIX : ne jamais exposer err.message complet en production
+    const safeMessage = IS_PROD ? 'Une erreur est survenue, réessaie.' : err.message;
+
     sendSSE(res, {
       type: 'agent_phase', phase: 'error',
-      thinking: { label: `Erreur : ${err.message.slice(0, 80)}`, icon: 'error', done: true },
+      thinking: { label: `Erreur : ${safeMessage.slice(0, 80)}`, icon: 'error', done: true },
     });
-    sendSSE(res, { type: 'error', message: err.message });
+    sendSSE(res, { type: 'error', message: safeMessage });
   }
 }
 
