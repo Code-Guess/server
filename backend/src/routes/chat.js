@@ -76,22 +76,20 @@ function resolveAttachmentType(att) {
   if (!att.mimeType) return null;
   let mime = att.mimeType.toLowerCase().trim();
 
-  // Normalisation alias
   if (mime === 'image/jpg') mime = 'image/jpeg';
 
-  // Cas mimeType générique → inférer depuis le nom de fichier
   if (['application/octet-stream', 'application/x-unknown', ''].includes(mime)) {
     const name = att.name?.toLowerCase() ?? '';
-    if (name.endsWith('.pdf'))  mime = 'application/pdf';
+    if (name.endsWith('.pdf'))                          mime = 'application/pdf';
     else if (name.endsWith('.jpg') || name.endsWith('.jpeg')) mime = 'image/jpeg';
-    else if (name.endsWith('.png'))  mime = 'image/png';
-    else if (name.endsWith('.gif'))  mime = 'image/gif';
-    else if (name.endsWith('.webp')) mime = 'image/webp';
+    else if (name.endsWith('.png'))                     mime = 'image/png';
+    else if (name.endsWith('.gif'))                     mime = 'image/gif';
+    else if (name.endsWith('.webp'))                    mime = 'image/webp';
     else return null;
   }
 
-  if (ACCEPTED_IMAGE_TYPES.has(mime))  return { resolvedType: 'image',    resolvedMime: mime };
-  if (ACCEPTED_DOC_TYPES.has(mime))    return { resolvedType: 'document',  resolvedMime: mime };
+  if (ACCEPTED_IMAGE_TYPES.has(mime)) return { resolvedType: 'image',    resolvedMime: mime };
+  if (ACCEPTED_DOC_TYPES.has(mime))   return { resolvedType: 'document', resolvedMime: mime };
   return null;
 }
 
@@ -107,8 +105,6 @@ function buildUserContent(message, attachments = []) {
       console.warn('[chat] Attachment ignoré — base64 ou mimeType manquant :', att.name);
       continue;
     }
-
-    // Type dérivé du mimeType côté serveur, jamais du champ `type` client
     const resolved = resolveAttachmentType(att);
     if (!resolved) {
       console.warn('[chat] Attachment ignoré — type non supporté :', att.mimeType, att.name);
@@ -136,20 +132,29 @@ function buildUserContent(message, attachments = []) {
 }
 
 // ── Détection de la nécessité d'une recherche web ────────────────────────────
+// Alignée avec searchRouter.js : normalisation des accents pour éviter
+// les incohérences entre les deux fichiers.
 
 const NO_SEARCH_PATTERNS = [
   /^(bonjour|salut|hello|hi|hey|bonsoir|coucou)\b/i,
   /^(merci|thanks|thank you)\b/i,
   /^\d[\d\s+\-*/^().,]*$/,
-  /^(résume|reformule|traduis|corrige|améliore)\s/i,
+  /^(resumes?|reformule|traduis|corrige|ameliore|resume)\s/i,
+  /^(r[eé]sum[eé]|r[eé]formule|traduis|corrige|am[eé]liore)\s/i,
   /^(continue|vas-y|ok|oui|non|d'accord)\b/i,
   /^(quel est ton nom|qui es-tu|tu es qui|what are you)\b/i,
 ];
 
+function normalize(str) {
+  return str.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
 function needsSearch(query) {
-  const q = query.trim();
+  if (!query || typeof query !== 'string') return false;
+  const q     = query.trim();
+  const qNorm = normalize(q);
   if (q.length < 8) return false;
-  return !NO_SEARCH_PATTERNS.some(re => re.test(q));
+  return !NO_SEARCH_PATTERNS.some(re => re.test(q) || re.test(qNorm));
 }
 
 // ── Helpers affichage recherche ───────────────────────────────────────────────
@@ -179,7 +184,6 @@ function buildSearchSummary(searchResult) {
 // ── Parser les étapes de thinking partiel ────────────────────────────────────
 
 function parseStepsFromPartial(partial) {
-  // Tentative JSON (avec completions courantes)
   const completions = [partial, partial + ']}', partial + '"]}', partial + '"}]}'];
   for (const attempt of completions) {
     try {
@@ -190,25 +194,20 @@ function parseStepsFromPartial(partial) {
     } catch {}
   }
 
-  // Fallback regex sur "title"
   const matches = [...partial.matchAll(/"title"\s*:\s*"([^"\\]+)"/g)];
   if (matches.length > 0) return matches.map(m => ({ title: m[1] }));
 
-  // Pas de fallback texte libre — trop risqué (prose / code visible dans l'UI)
   return [];
 }
 
 // ── Nettoyage du contenu affiché (retire les balises <thinking>) ──────────────
 
 function stripThinking(content) {
-  // Cas normal : tag fermé
   if (content.includes('</thinking>')) {
     return content
       .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
       .trimStart();
   }
-  // Tag ouvert mais jamais fermé (timeout / erreur mid-stream)
-  // → on garde seulement ce qui précède <thinking>
   const idx = content.indexOf('<thinking>');
   if (idx !== -1) {
     return content.slice(0, idx).trimEnd();
@@ -230,7 +229,6 @@ router.post('/', async (req, res) => {
     attachments = [],
   } = req.body;
 
-  // ── Strict boolean : jamais de valeur truthy arbitraire ───────────────────
   const deepResearch = req.body.deepResearch === true;
 
   // ── Validation des inputs ─────────────────────────────────────────────────
@@ -240,11 +238,11 @@ router.post('/', async (req, res) => {
   }
 
   // ── Valeurs sécurisées ────────────────────────────────────────────────────
-  const resolvedModel       = typeof model === 'string' && model.trim().length > 0
+  const resolvedModel   = typeof model === 'string' && model.trim().length > 0
     ? model.trim()
     : 'opus';
-  const safeMaxTokens       = Math.min(Number(max_tokens)  || 8192, LIMITS.MAX_TOKENS_CAP);
-  const safeTemperature     = Math.max(
+  const safeMaxTokens   = Math.min(Number(max_tokens)  || 8192, LIMITS.MAX_TOKENS_CAP);
+  const safeTemperature = Math.max(
     LIMITS.TEMPERATURE_MIN,
     Math.min(LIMITS.TEMPERATURE_MAX, Number(temperature) || 0.7)
   );
@@ -267,19 +265,25 @@ router.post('/', async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-
-  // Guard : done() ne peut être appelé qu'une seule fois
+  // ── Guard : send() et done() sûrs même après déconnexion client ───────────
   let isDone = false;
+
+  const send = (data) => {
+    // ← FIX : vérifier que la connexion est encore ouverte avant d'écrire
+    if (isDone || res.writableEnded || res.destroyed) return;
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
   const done = () => {
     if (isDone) return;
     isDone = true;
-    res.write('data: [DONE]\n\n');
-    res.end();
+    if (!res.writableEnded && !res.destroyed) {
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
   };
 
   // ── Helper : construction des messages history ────────────────────────────
-  // Sécurité : on n'accepte que 'user' et 'assistant', jamais 'system'
   const VALID_ROLES = new Set(['user', 'assistant']);
 
   function buildHistory() {
@@ -302,12 +306,13 @@ router.post('/', async (req, res) => {
 
     // ── 1. Pipeline code (deep research) ──────────────────────────────────────
     if (deepResearch && needsCodePipeline(message)) {
-      await runCodePipeline(message, (agentSteps) => {
+      // ← FIX : await/then antipattern remplacé par await direct
+      // done() est garanti même si runCodePipeline throw
+      const result = await runCodePipeline(message, (agentSteps) => {
         send({ type: 'pipeline', steps: agentSteps });
-      }).then(result => {
-        send({ type: 'codeResult', result });
-        done();
       });
+      send({ type: 'codeResult', result });
+      done();
       return;
     }
 
@@ -325,7 +330,7 @@ router.post('/', async (req, res) => {
       await runAgentLoop({
         res,
         messages,
-        model:       'sonnet',          // agent loop utilise toujours sonnet
+        model:       'sonnet',
         max_tokens:  safeMaxTokens,
         temperature: safeTemperature,
       });
@@ -335,9 +340,10 @@ router.post('/', async (req, res) => {
     // ── 3. Recherche web ───────────────────────────────────────────────────────
     let systemContext = '';
     let sources       = [];
-    const shouldSearch = message.trim().length >= 8 && needsSearch(message);
 
-    if (shouldSearch) {
+    // ← FIX : suppression du check redondant `message.trim().length >= 8`
+    //   (needsSearch le vérifie déjà en interne)
+    if (needsSearch(message)) {
       send({ type: 'searching', status: 'loading', label: 'Recherche en cours…', icon: 'globe' });
 
       try {
@@ -378,6 +384,9 @@ router.post('/', async (req, res) => {
     ];
 
     // ── 5. Appel LLM ──────────────────────────────────────────────────────────
+    // streamedContent accumule le texte complet reçu chunk par chunk.
+    // openRouterFetch passe maintenant le DELTA (nouveau morceau seulement)
+    // dans onChunk → on accumule avec +=, pas =.
     let streamedContent = '';
 
     const result = await openRouterFetch({
@@ -386,13 +395,14 @@ router.post('/', async (req, res) => {
       temperature: safeTemperature,
       messages,
 
-      onChunk: (fullContent) => {
-        streamedContent = fullContent;
+      onChunk: (chunk) => {
+        // ← FIX : += pour accumuler le delta, au lieu de = qui écrasait
+        streamedContent += chunk;
 
         const hasOpen  = streamedContent.includes('<thinking>');
         const hasClose = streamedContent.includes('</thinking>');
 
-        // Thinking en cours : parser les étapes et envoyer ce qui précède
+        // Thinking en cours : envoyer ce qui précède + étapes partielles
         if (hasOpen && !hasClose) {
           const before = streamedContent
             .slice(0, streamedContent.indexOf('<thinking>'))
@@ -404,28 +414,20 @@ router.post('/', async (req, res) => {
           if (steps.length > 0) {
             send({
               type:  'thinkingSteps',
-              steps: steps.map((s, i) => ({
-                label: s.title,
-                icon:  'think',
-                done:  false,
-              })),
+              steps: steps.map(s => ({ label: s.title, icon: 'think', done: false })),
             });
           }
           return;
         }
 
-        // Thinking fermé : envoyer le contenu nettoyé
+        // Thinking fermé : envoyer les étapes finales
         if (hasOpen && hasClose) {
           const partial = streamedContent.split('<thinking>')[1]?.split('</thinking>')[0] ?? '';
           const steps   = parseStepsFromPartial(partial);
           if (steps.length > 0) {
             send({
               type:  'thinkingSteps',
-              steps: steps.map((s, i) => ({
-                label: s.title,
-                icon:  'think',
-                done:  true,
-              })),
+              steps: steps.map(s => ({ label: s.title, icon: 'think', done: true })),
             });
           }
         }
@@ -435,9 +437,9 @@ router.post('/', async (req, res) => {
       },
     });
 
-    // Flush final garanti
-    const finalDisplay = stripThinking(streamedContent);
-    if (finalDisplay) send({ type: 'chunk', content: finalDisplay });
+    // ← FIX : "flush final garanti" supprimé — c'était un doublon exact du
+    //   dernier appel onChunk. Le frontend recevait le contenu complet deux fois.
+    //   onChunk gère déjà tous les cas (thinking ouvert, fermé, absent).
 
     send({ type: 'done', modelUsed: result.modelUsed });
     done();
