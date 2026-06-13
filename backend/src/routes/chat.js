@@ -1,6 +1,11 @@
 'use strict';
 
 // src/routes/chat.js
+// ─────────────────────────────────────────────────────────────────────────────
+// Support des pièces jointes (images + PDF) avec détection multimodale
+// La conversion Anthropic → OpenAI est gérée dans openrouter.js
+// Le prefill arith-table est géré automatiquement dans openrouter.js
+// ─────────────────────────────────────────────────────────────────────────────
 
 const express = require('express');
 const router  = express.Router();
@@ -11,74 +16,68 @@ const { runSearchAgent }                     = require('../agents/searchAgents')
 const { runCodePipeline, needsCodePipeline } = require('../agents/codeAgents');
 const { runAgentLoop, needsAgentLoop }       = require('../tools/agentLoop');
 
-const LIMITS = {
-  MESSAGE_MAX_LENGTH:    20_000,
-  MAX_ATTACHMENTS:       5,
-  MAX_TOKENS_CAP:        8_192,
-  MAX_BASE64_SIZE_BYTES: 10 * 1024 * 1024,
-  TEMPERATURE_MIN:       0,
-  TEMPERATURE_MAX:       1,
-};
+// ── Types MIME acceptés ───────────────────────────────────────────────────────
 
-const ACCEPTED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-const ACCEPTED_DOC_TYPES   = new Set(['application/pdf']);
+const ACCEPTED_IMAGE_TYPES = new Set([
+  'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp',
+]);
 
-function validateInputs(message, attachments, max_tokens, temperature) {
-  if (typeof message !== 'string' || message.trim().length === 0) return 'message requis';
-  if (message.length > LIMITS.MESSAGE_MAX_LENGTH) return `message trop long (max ${LIMITS.MESSAGE_MAX_LENGTH} caractères)`;
-  if (!Array.isArray(attachments)) return 'attachments doit être un tableau';
-  if (attachments.length > LIMITS.MAX_ATTACHMENTS) return `trop de pièces jointes (max ${LIMITS.MAX_ATTACHMENTS})`;
-  for (const att of attachments) {
-    if (att.base64 && att.base64.length * 0.75 > LIMITS.MAX_BASE64_SIZE_BYTES)
-      return `pièce jointe trop volumineuse : ${att.name ?? 'inconnue'} (max 10 Mo)`;
-  }
-  if (max_tokens !== undefined) {
-    const n = Number(max_tokens);
-    if (!Number.isInteger(n) || n < 1) return 'max_tokens invalide';
-  }
-  if (temperature !== undefined) {
-    const t = Number(temperature);
-    if (isNaN(t) || t < LIMITS.TEMPERATURE_MIN || t > LIMITS.TEMPERATURE_MAX)
-      return `temperature doit être entre ${LIMITS.TEMPERATURE_MIN} et ${LIMITS.TEMPERATURE_MAX}`;
-  }
-  return null;
-}
+const ACCEPTED_DOC_TYPES = new Set([
+  'application/pdf',
+]);
 
-function resolveAttachmentType(att) {
-  if (!att.mimeType) return null;
-  let mime = att.mimeType.toLowerCase().trim();
-  if (mime === 'image/jpg') mime = 'image/jpeg';
-  if (['application/octet-stream', 'application/x-unknown', ''].includes(mime)) {
-    const name = att.name?.toLowerCase() ?? '';
-    if (name.endsWith('.pdf'))                                mime = 'application/pdf';
-    else if (name.endsWith('.jpg') || name.endsWith('.jpeg')) mime = 'image/jpeg';
-    else if (name.endsWith('.png'))                           mime = 'image/png';
-    else if (name.endsWith('.gif'))                           mime = 'image/gif';
-    else if (name.endsWith('.webp'))                          mime = 'image/webp';
-    else return null;
-  }
-  if (ACCEPTED_IMAGE_TYPES.has(mime)) return { resolvedType: 'image',    resolvedMime: mime };
-  if (ACCEPTED_DOC_TYPES.has(mime))   return { resolvedType: 'document', resolvedMime: mime };
-  return null;
-}
+// ── Construction du contenu user avec pièces jointes ─────────────────────────
 
 function buildUserContent(message, attachments = []) {
   if (!attachments || attachments.length === 0) return message;
+
   const blocks = [];
+
   for (const att of attachments) {
-    if (!att.base64 || !att.mimeType) { console.warn('[chat] Attachment ignoré :', att.name); continue; }
-    const resolved = resolveAttachmentType(att);
-    if (!resolved) { console.warn('[chat] Type non supporté :', att.mimeType, att.name); continue; }
-    const { resolvedType, resolvedMime } = resolved;
-    if (resolvedType === 'image')
-      blocks.push({ type: 'image', source: { type: 'base64', media_type: resolvedMime, data: att.base64 } });
-    else if (resolvedType === 'document')
-      blocks.push({ type: 'document', source: { type: 'base64', media_type: resolvedMime, data: att.base64 } });
+    if (!att.base64 || !att.mimeType) {
+      console.warn('[chat] Attachment ignoré — base64 ou mimeType manquant :', att.name);
+      continue;
+    }
+
+    if (att.type === 'image') {
+      let mimeType = att.mimeType.toLowerCase();
+      if (mimeType === 'image/jpg') mimeType = 'image/jpeg';
+      if (!ACCEPTED_IMAGE_TYPES.has(mimeType)) {
+        console.warn('[chat] Image ignorée — mimeType non supporté :', mimeType);
+        continue;
+      }
+      blocks.push({
+        type: 'image',
+        source: { type: 'base64', media_type: mimeType, data: att.base64 },
+      });
+
+    } else if (att.type === 'document') {
+      let mimeType = att.mimeType.toLowerCase();
+      if (['application/octet-stream', 'application/x-unknown', ''].includes(mimeType)) {
+        if (att.name?.toLowerCase().endsWith('.pdf')) {
+          mimeType = 'application/pdf';
+        } else {
+          console.warn('[chat] Document ignoré — mimeType non déterminable :', att.name);
+          continue;
+        }
+      }
+      if (!ACCEPTED_DOC_TYPES.has(mimeType)) {
+        console.warn('[chat] Document ignoré — mimeType non supporté :', mimeType);
+        continue;
+      }
+      blocks.push({
+        type: 'document',
+        source: { type: 'base64', media_type: mimeType, data: att.base64 },
+      });
+    }
   }
+
   if (blocks.length === 0) return message;
   if (message?.trim().length > 0) blocks.push({ type: 'text', text: message });
   return blocks;
 }
+
+// ── Détection de la nécessité d'une recherche web ────────────────────────────
 
 const NO_SEARCH_PATTERNS = [
   /^(bonjour|salut|hello|hi|hey|bonsoir|coucou)\b/i,
@@ -95,6 +94,8 @@ function needsSearch(query) {
   return !NO_SEARCH_PATTERNS.some(re => re.test(q));
 }
 
+// ── Helpers affichage recherche ───────────────────────────────────────────────
+
 function getAgentLabel(agent) {
   switch (agent) {
     case 'image':     return 'images';
@@ -110,52 +111,73 @@ function buildSearchSummary(searchResult) {
   const { agent, sources } = searchResult;
   const count  = sources.length;
   const label  = getAgentLabel(agent);
-  const titles = sources.slice(0, 3)
+  const titles = sources
+    .slice(0, 3)
     .map(s => `• ${s.title.slice(0, 60)}${s.title.length > 60 ? '…' : ''}`)
     .join('\n');
   return `J'ai trouvé ${count} ${label} :\n${titles}${count > 3 ? `\n• … et ${count - 3} de plus` : ''}\n\nJe synthétise maintenant…`;
 }
+
+// ── Parser les étapes de thinking partiel ────────────────────────────────────
 
 function parseStepsFromPartial(partial) {
   const completions = [partial, partial + ']}', partial + '"]}', partial + '"}]}'];
   for (const attempt of completions) {
     try {
       const parsed = JSON.parse(attempt.trim());
-      if (parsed?.steps && Array.isArray(parsed.steps) && parsed.steps.length > 0)
+      if (parsed?.steps && Array.isArray(parsed.steps) && parsed.steps.length > 0) {
         return parsed.steps.map(s => ({ title: String(s.title ?? '') }));
+      }
     } catch {}
   }
   const matches = [...partial.matchAll(/"title"\s*:\s*"([^"\\]+)"/g)];
   if (matches.length > 0) return matches.map(m => ({ title: m[1] }));
+  const lines = partial.split('\n')
+    .map(l => l.replace(/^[-*•#>\d.)\s]+/, '').trim())
+    .filter(l => l.length > 4);
+  if (lines.length > 0) return lines.slice(0, 4).map(l => ({ title: l.slice(0, 80) }));
   return [];
 }
 
+// ── Nettoyage du contenu affiché (retire les balises <thinking>) ──────────────
+
 function stripThinking(content) {
-  if (content.includes('</thinking>'))
-    return content.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '').trimStart();
-  const idx = content.indexOf('<thinking>');
-  if (idx !== -1) return content.slice(0, idx).trimEnd();
-  return content;
+  return content
+    .replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '')
+    .trimStart();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Route principale
+// ─────────────────────────────────────────────────────────────────────────────
 
 router.post('/', async (req, res) => {
-  const { message, history = [], model, max_tokens, temperature, attachments = [] } = req.body;
-  const deepResearch = req.body.deepResearch === true;
+  const {
+    message,
+    history      = [],
+    model        = 'opus',
+    deepResearch = false,
+    max_tokens,
+    temperature,
+    attachments  = [],
+  } = req.body;
 
-  const validationError = validateInputs(message, attachments, max_tokens, temperature);
-  if (validationError) return res.status(400).json({ error: validationError });
-
-  const resolvedModel   = typeof model === 'string' && model.trim().length > 0 ? model.trim() : 'opus';
-  const safeMaxTokens   = Math.min(Number(max_tokens) || 8192, LIMITS.MAX_TOKENS_CAP);
-  const safeTemperature = Math.max(LIMITS.TEMPERATURE_MIN, Math.min(LIMITS.TEMPERATURE_MAX, Number(temperature) || 0.7));
-
-  if (attachments.length > 0) {
-    console.log(`[chat] ${attachments.length} pièce(s) jointe(s) :`,
-      attachments.map(a => `${a.name} (${a.mimeType}, ${a.base64 ? Math.round(a.base64.length / 1024) + ' Ko' : 'ABSENT'})`).join(', '));
+  if (!message || typeof message !== 'string') {
+    return res.status(400).json({ error: 'message requis' });
   }
 
+  if (attachments.length > 0) {
+    console.log(
+      `[chat] ${attachments.length} pièce(s) jointe(s) :`,
+      attachments.map(a =>
+        `${a.name} (${a.type}, ${a.mimeType}, ${
+          a.base64 ? Math.round(a.base64.length / 1024) + ' Ko' : 'ABSENT'
+        })`
+      ).join(', ')
+    );
+  }
+
+  // ── SSE setup ─────────────────────────────────────────────────────────────
   res.setHeader('Content-Type',      'text/event-stream');
   res.setHeader('Cache-Control',     'no-cache');
   res.setHeader('Connection',        'keep-alive');
@@ -163,38 +185,50 @@ router.post('/', async (req, res) => {
   res.flushHeaders();
 
   const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const done = ()      => { res.write('data: [DONE]\n\n'); res.end(); };
 
-  let isDone = false;
-  const done = () => {
-    if (isDone) return;
-    isDone = true;
-    res.write('data: [DONE]\n\n');
-    res.end();
-  };
-
-  const VALID_ROLES = new Set(['user', 'assistant']);
+  // ── Helper : construction des messages history ────────────────────────────
   function buildHistory() {
-    return (Array.isArray(history) ? history : [])
-      .filter(m => m && typeof m === 'object' && VALID_ROLES.has(m.role) && m.content && typeof m.content === 'string')
-      .map(m => ({ role: m.role, content: m.role === 'assistant' ? stripThinking(m.content) : m.content }))
+    return (history ?? [])
+      .filter(m => m.role && m.content)
+      .map(m => ({
+        role:    m.role,
+        content: m.role === 'assistant' ? stripThinking(m.content) : m.content,
+      }))
       .filter(m => m.content.trim().length > 0);
   }
 
   try {
 
-    // ── 1. Pipeline code ──────────────────────────────────────────────────────
+    // ── 1. Pipeline code (deep research) ─────────────────────────────────────
     if (deepResearch && needsCodePipeline(message)) {
-      await runCodePipeline(message, (agentSteps) => send({ type: 'pipeline', steps: agentSteps }))
-        .then(result => { send({ type: 'codeResult', result }); done(); });
+      await runCodePipeline(message, (agentSteps) => {
+        send({ type: 'pipeline', steps: agentSteps });
+      }).then(result => {
+        send({ type: 'codeResult', result });
+        done();
+      });
       return;
     }
 
-    // ── 2. Agent loop ─────────────────────────────────────────────────────────
+    // ── 2. Agent loop (execute_code / edit_file) ──────────────────────────────
     if (!deepResearch && needsAgentLoop(message)) {
       const systemPrompt = getSystemPrompt(message, undefined);
       const userContent  = buildUserContent(message, attachments);
-      const messages = [{ role: 'system', content: systemPrompt }, ...buildHistory(), { role: 'user', content: userContent }];
-      await runAgentLoop({ res, messages, model: 'sonnet', max_tokens: safeMaxTokens, temperature: safeTemperature });
+
+      const messages = [
+        { role: 'system', content: systemPrompt },
+        ...buildHistory(),
+        { role: 'user', content: userContent },
+      ];
+
+      await runAgentLoop({
+        res,
+        messages,
+        model:       model ?? 'sonnet',
+        max_tokens:  max_tokens  ?? 8192,
+        temperature: temperature ?? 0.2,
+      });
       return;
     }
 
@@ -205,17 +239,28 @@ router.post('/', async (req, res) => {
 
     if (shouldSearch) {
       send({ type: 'searching', status: 'loading', label: 'Recherche en cours…', icon: 'globe' });
+
       try {
         const searchResult = await runSearchAgent(message);
+
         if (searchResult?.sources?.length > 0 || searchResult?.images?.length > 0) {
           sources       = searchResult.sources;
           systemContext = searchResult.contextBlock;
-          if (sources.length > 0) send({ type: 'sources', sources, agent: searchResult.agent });
-          if (searchResult.images?.length > 0) send({ type: 'images', images: searchResult.images, intent: searchResult.imageIntent ?? 'none' });
-          send({ type: 'searching', status: 'done', label: buildSearchSummary(searchResult), icon: 'globe', count: sources.length, agent: searchResult.agent });
+
+          if (sources.length > 0) {
+            send({ type: 'sources', sources, agent: searchResult.agent });
+          }
+          if (searchResult.images?.length > 0) {
+            send({ type: 'images', images: searchResult.images, intent: searchResult.imageIntent ?? 'none' });
+          }
+
+          const summary = buildSearchSummary(searchResult);
+          send({ type: 'searching', status: 'done', label: summary, icon: 'globe', count: sources.length, agent: searchResult.agent });
+
         } else {
           send({ type: 'searching', status: 'done', label: 'Aucun résultat — je réponds avec mes connaissances.', icon: 'globe' });
         }
+
       } catch (err) {
         console.warn('[chat] Recherche échouée :', err.message);
         send({ type: 'searching', status: 'error', label: 'Recherche indisponible — réponse directe.', icon: 'globe' });
@@ -225,108 +270,56 @@ router.post('/', async (req, res) => {
     // ── 4. Construction des messages ──────────────────────────────────────────
     const systemPrompt = getSystemPrompt(message, systemContext || undefined);
     const userContent  = buildUserContent(message, attachments);
-    const messages = [{ role: 'system', content: systemPrompt }, ...buildHistory(), { role: 'user', content: userContent }];
 
-    // ── 5. Appel LLM ──────────────────────────────────────────────────────────
-    //
-    // owl-alpha met TOUT dans delta.reasoning et RIEN dans delta.content.
-    // On accumule les deux séparément.
-    // Règle d'affichage :
-    //   - Pendant le stream : on streame reasoning en { type:'thinking' }
-    //                         et content en { type:'replace' }
-    //   - À la fin : si content est vide → on utilise reasoning comme contenu visible
-    //
-    let accContent          = '';
-    let accReasoning        = '';
-    let lastSentThinkingLen = 0;
-    let thinkingDone        = false;
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...buildHistory(),
+      { role: 'user', content: userContent },
+    ];
 
-    // lastSentDisplayLen : curseur sur accContent pour ne pas renvoyer
-    // le même texte visible deux fois via replace
-    let lastSentDisplayLen  = 0;
+    // ── 5. Appel LLM (prefill arith-table géré automatiquement dans openrouter.js)
+    let streamedContent = '';
 
     const result = await openRouterFetch({
-      model:       resolvedModel,
-      max_tokens:  safeMaxTokens,
-      temperature: safeTemperature,
+      model:       model ?? 'opus',
+      max_tokens:  max_tokens  ?? 8192,
+      temperature: temperature ?? 0.7,
       messages,
 
-      // delta de content
-      onChunk: (delta) => {
-        accContent += delta;
+      onChunk: (fullContent) => {
+        streamedContent = fullContent;
 
-        const openIdx  = accContent.indexOf('<thinking>');
-        const closeIdx = accContent.indexOf('</thinking>');
-        const hasOpen  = openIdx  !== -1;
-        const hasClose = closeIdx !== -1;
-
-        // ── Thinking en cours ─────────────────────────────────────────────
-        if (hasOpen && !hasClose) {
-          // Contenu AVANT <thinking> — envoyé une seule fois
-          const before = accContent.slice(0, openIdx).trimEnd();
-          if (before && before.length > lastSentDisplayLen) {
-            send({ type: 'replace', content: before });
-            lastSentDisplayLen = before.length;
+        // Thinking steps
+        const thinkMatch = streamedContent.match(/<thinking>([\s\S]*)/);
+        if (thinkMatch) {
+          const partial = thinkMatch[1];
+          const steps   = parseStepsFromPartial(partial);
+          if (steps.length > 0) {
+            const thinkingComplete = streamedContent.includes('</thinking>');
+            send({
+              type:  'thinkingSteps',
+              steps: steps.map((s, i) => ({
+                label: s.title,
+                icon:  'think',
+                done:  thinkingComplete || i < steps.length - 1,
+              })),
+            });
           }
-          // Delta brut du thinking
-          const thinkingFull  = accContent.slice(openIdx + '<thinking>'.length);
-          const thinkingDelta = thinkingFull.slice(lastSentThinkingLen);
-          if (thinkingDelta.length > 0) {
-            send({ type: 'thinking', content: thinkingDelta });
-            lastSentThinkingLen = thinkingFull.length;
-          }
-          const steps = parseStepsFromPartial(thinkingFull);
-          if (steps.length > 0)
-            send({ type: 'thinkingSteps', steps: steps.map(s => ({ label: s.title, icon: 'think', done: false })) });
-          return;
         }
 
-        // ── Thinking fermé ────────────────────────────────────────────────
-        if (hasOpen && hasClose && !thinkingDone) {
-          thinkingDone = true;
-          const thinkingFull  = accContent.slice(openIdx + '<thinking>'.length, closeIdx);
-          const thinkingDelta = thinkingFull.slice(lastSentThinkingLen);
-          if (thinkingDelta.length > 0) {
-            send({ type: 'thinking', content: thinkingDelta });
-            lastSentThinkingLen = thinkingFull.length;
-          }
-          const steps = parseStepsFromPartial(thinkingFull);
-          if (steps.length > 0)
-            send({ type: 'thinkingSteps', steps: steps.map(s => ({ label: s.title, icon: 'think', done: true })) });
-        }
+        // N'envoyer le contenu affiché qu'une fois le thinking fermé
+        if (!streamedContent.includes('</thinking>')) return;
 
-        // Contenu visible nettoyé — toujours envoyé en replace (contenu COMPLET)
-        const displayContent = stripThinking(accContent);
-        if (displayContent) send({ type: 'replace', content: displayContent });
-      },
+        const displayContent = stripThinking(streamedContent);
+        if (!displayContent) return;
 
-      // delta de reasoning (owl-alpha met tout ici)
-      onReasoningChunk: (delta) => {
-        accReasoning += delta;
-        // Streamer le reasoning comme thinking en temps réel
-        send({ type: 'thinking', content: delta });
+        send({ type: 'chunk', content: displayContent });
       },
     });
 
-    // ── Flush final ────────────────────────────────────────────────────────────
-    //
-    // FIX PRINCIPAL : owl-alpha envoie tout via reasoning, content reste vide.
-    // Si c'est le cas, on utilise reasoning comme contenu visible final.
-    //
-    let finalContent = stripThinking(accContent);
-
-    if (!finalContent.trim() && accReasoning.trim()) {
-      // Le modèle a tout mis dans reasoning — on l'utilise comme réponse
-      console.log('[chat] Fallback : contenu vide → utilisation du reasoning comme réponse');
-      finalContent = accReasoning;
-    }
-
-    if (finalContent.trim()) {
-      send({ type: 'replace', content: finalContent });
-    } else {
-      // Vraiment rien — erreur explicite pour debug
-      console.error('[chat] Réponse finale vide — accContent:', JSON.stringify(accContent.slice(0, 200)), '| accReasoning:', JSON.stringify(accReasoning.slice(0, 200)));
-    }
+    // Flush final garanti
+    const finalDisplay = stripThinking(streamedContent);
+    if (finalDisplay) send({ type: 'chunk', content: finalDisplay });
 
     send({ type: 'done', modelUsed: result.modelUsed });
     done();
