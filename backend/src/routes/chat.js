@@ -88,12 +88,19 @@ function buildUserContent(message, attachments = []) {
 }
 
 const NO_SEARCH_PATTERNS = [
+  // Salutations & formules courtes
   /^(bonjour|salut|hello|hi|hey|bonsoir|coucou)\b/i,
   /^(merci|thanks|thank you)\b/i,
   /^\d[\d\s+\-*/^().,]*$/,
   /^(résume|reformule|traduis|corrige|améliore)\s/i,
   /^(continue|vas-y|ok|oui|non|d'accord)\b/i,
   /^(quel est ton nom|qui es-tu|tu es qui|what are you)\b/i,
+  // Demandes code & modification
+  /\b(code|fixe|corrige|modifie|ajoute|supprime|refactorise|optimise|debug|débogu)\b/i,
+  /\b(fonction|composant|script|fichier|classe|méthode|variable|hook|api|route|endpoint)\b/i,
+  /\b(crée?|génère?|écris?)\s.*(app|site|page|formulaire|bouton|modal|interface)\b/i,
+  // Message contient déjà du code
+  /```[\s\S]*```/,
 ];
 
 function needsSearch(query) {
@@ -233,6 +240,7 @@ router.post('/', async (req, res) => {
     let lastSentThinkingLen = 0;
     let thinkingDone        = false;
     let lastSentDisplayLen  = 0;
+    let lastReplaceTime     = 0;
 
     const result = await openRouterFetch({
       model:       resolvedModel,
@@ -279,19 +287,26 @@ router.post('/', async (req, res) => {
           const steps = parseStepsFromPartial(thinkingFull);
           if (steps.length > 0)
             send({ type: 'thinkingSteps', steps: steps.map(s => ({ label: s.title, icon: 'think', done: true })) });
-          // ← return : on attend le prochain chunk pour envoyer le contenu visible
-          // évite d'envoyer un replace vide juste après la fermeture du thinking
+          // attend le prochain chunk avant d'envoyer le contenu visible
           return;
         }
 
         // ── Buffer tags partiels ────────────────────────────────────────────
-        if (!hasOpen && isPotentialTag(accContent, THINKING_OPEN))  return;
+        if (!hasOpen && isPotentialTag(accContent, THINKING_OPEN))          return;
         if (!hasClose && hasOpen && isPotentialTag(accContent, THINKING_CLOSE)) return;
 
-        // ── Contenu visible ─────────────────────────────────────────────────
+        // ── Contenu visible avec throttle sur les blocs de code ────────────
         const displayContent = stripThinking(accContent);
-        if (displayContent && displayContent.trim().length > 0)
-          send({ type: 'replace', content: displayContent });
+        if (!displayContent || !displayContent.trim()) return;
+
+        const now             = Date.now();
+        const insideCodeBlock = (displayContent.match(/```/g) ?? []).length % 2 === 1;
+        const throttle        = insideCodeBlock ? 150 : 0;
+
+        if (now - lastReplaceTime < throttle) return;
+        lastReplaceTime = now;
+
+        send({ type: 'replace', content: displayContent });
       },
 
       onReasoningChunk: (delta) => {
