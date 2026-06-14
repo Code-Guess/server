@@ -145,6 +145,8 @@ function stripThinking(content) {
   return content;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+
 router.post('/', async (req, res) => {
   const { message, history = [], model, max_tokens, temperature, attachments = [] } = req.body;
   const deepResearch = req.body.deepResearch === true;
@@ -246,6 +248,7 @@ router.post('/', async (req, res) => {
         const hasOpen  = openIdx  !== -1;
         const hasClose = closeIdx !== -1;
 
+        // ── Thinking en cours ───────────────────────────────────────────────
         if (hasOpen && !hasClose) {
           const before = accContent.slice(0, openIdx).trimEnd();
           if (before && before.length > lastSentDisplayLen) {
@@ -264,6 +267,7 @@ router.post('/', async (req, res) => {
           return;
         }
 
+        // ── Thinking fermé ──────────────────────────────────────────────────
         if (hasOpen && hasClose && !thinkingDone) {
           thinkingDone = true;
           const thinkingFull  = accContent.slice(openIdx + THINKING_OPEN.length, closeIdx);
@@ -275,13 +279,19 @@ router.post('/', async (req, res) => {
           const steps = parseStepsFromPartial(thinkingFull);
           if (steps.length > 0)
             send({ type: 'thinkingSteps', steps: steps.map(s => ({ label: s.title, icon: 'think', done: true })) });
+          // ← return : on attend le prochain chunk pour envoyer le contenu visible
+          // évite d'envoyer un replace vide juste après la fermeture du thinking
+          return;
         }
 
-        if (!hasOpen && isPotentialTag(accContent, THINKING_OPEN)) return;
+        // ── Buffer tags partiels ────────────────────────────────────────────
+        if (!hasOpen && isPotentialTag(accContent, THINKING_OPEN))  return;
         if (!hasClose && hasOpen && isPotentialTag(accContent, THINKING_CLOSE)) return;
 
+        // ── Contenu visible ─────────────────────────────────────────────────
         const displayContent = stripThinking(accContent);
-        if (displayContent) send({ type: 'replace', content: displayContent });
+        if (displayContent && displayContent.trim().length > 0)
+          send({ type: 'replace', content: displayContent });
       },
 
       onReasoningChunk: (delta) => {
