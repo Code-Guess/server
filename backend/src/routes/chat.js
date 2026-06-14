@@ -1,7 +1,5 @@
 'use strict';
 
-// src/routes/chat.js
-
 const express = require('express');
 const router  = express.Router();
 
@@ -9,7 +7,6 @@ const { openRouterFetch }                    = require('../openrouter');
 const { getSystemPrompt }                    = require('../prompts');
 const { runSearchAgent }                     = require('../agents/searchAgents');
 const { runCodePipeline, needsCodePipeline } = require('../agents/codeAgents');
-const { runAgentLoop, needsAgentLoop }       = require('../tools/agentLoop');
 
 const LIMITS = {
   MESSAGE_MAX_LENGTH:    20_000,
@@ -26,11 +23,6 @@ const THINKING_CLOSE = '</thinking>';
 const ACCEPTED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 const ACCEPTED_DOC_TYPES   = new Set(['application/pdf']);
 
-/**
- * Retourne true si la fin de `str` pourrait être le début de `tag`.
- * Permet de buffer les chunks partiels avant qu'un tag soit complet.
- * Ex: str="bonjour <th", tag="<thinking>" → true
- */
 function isPotentialTag(str, tag) {
   for (let len = Math.min(tag.length - 1, str.length); len >= 1; len--) {
     if (str.endsWith(tag.slice(0, len))) return true;
@@ -153,8 +145,6 @@ function stripThinking(content) {
   return content;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-
 router.post('/', async (req, res) => {
   const { message, history = [], model, max_tokens, temperature, attachments = [] } = req.body;
   const deepResearch = req.body.deepResearch === true;
@@ -204,14 +194,7 @@ router.post('/', async (req, res) => {
       return;
     }
 
-    // ── 2. Agent loop ─────────────────────────────────────────────────────────
-    if (!deepResearch && needsAgentLoop(message)) {
-      const systemPrompt = getSystemPrompt(message, undefined);
-      const userContent  = buildUserContent(message, attachments);
-      const messages = [{ role: 'system', content: systemPrompt }, ...buildHistory(), { role: 'user', content: userContent }];
-      await runAgentLoop({ res, messages, model: 'sonnet', max_tokens: safeMaxTokens, temperature: safeTemperature });
-      return;
-    }
+    // ── 2. Agent loop désactivé ───────────────────────────────────────────────
 
     // ── 3. Recherche web ──────────────────────────────────────────────────────
     let systemContext = '';
@@ -263,15 +246,12 @@ router.post('/', async (req, res) => {
         const hasOpen  = openIdx  !== -1;
         const hasClose = closeIdx !== -1;
 
-        // ── Thinking en cours ───────────────────────────────────────────────
         if (hasOpen && !hasClose) {
-          // Contenu AVANT <thinking> — envoyé une seule fois
           const before = accContent.slice(0, openIdx).trimEnd();
           if (before && before.length > lastSentDisplayLen) {
             send({ type: 'replace', content: before });
             lastSentDisplayLen = before.length;
           }
-          // Delta brut du thinking
           const thinkingFull  = accContent.slice(openIdx + THINKING_OPEN.length);
           const thinkingDelta = thinkingFull.slice(lastSentThinkingLen);
           if (thinkingDelta.length > 0) {
@@ -284,7 +264,6 @@ router.post('/', async (req, res) => {
           return;
         }
 
-        // ── Thinking fermé ──────────────────────────────────────────────────
         if (hasOpen && hasClose && !thinkingDone) {
           thinkingDone = true;
           const thinkingFull  = accContent.slice(openIdx + THINKING_OPEN.length, closeIdx);
@@ -298,14 +277,9 @@ router.post('/', async (req, res) => {
             send({ type: 'thinkingSteps', steps: steps.map(s => ({ label: s.title, icon: 'think', done: true })) });
         }
 
-        // ── FIX : buffer si la fin d'accContent est un tag partiel ─────────
-        // Cas 1 : pas encore de <thinking> mais la fin ressemble à son début
         if (!hasOpen && isPotentialTag(accContent, THINKING_OPEN)) return;
-
-        // Cas 2 : thinking fermé mais la fin ressemble à un début de </thinking>
         if (!hasClose && hasOpen && isPotentialTag(accContent, THINKING_CLOSE)) return;
 
-        // ── Contenu visible nettoyé ─────────────────────────────────────────
         const displayContent = stripThinking(accContent);
         if (displayContent) send({ type: 'replace', content: displayContent });
       },
@@ -318,17 +292,8 @@ router.post('/', async (req, res) => {
 
     // ── Flush final ────────────────────────────────────────────────────────────
     let finalContent = stripThinking(accContent);
-
-    if (!finalContent.trim() && accReasoning.trim()) {
-      console.log('[chat] Fallback : contenu vide → utilisation du reasoning comme réponse');
-      finalContent = accReasoning;
-    }
-
-    if (finalContent.trim()) {
-      send({ type: 'replace', content: finalContent });
-    } else {
-      console.error('[chat] Réponse finale vide — accContent:', JSON.stringify(accContent.slice(0, 200)), '| accReasoning:', JSON.stringify(accReasoning.slice(0, 200)));
-    }
+    if (!finalContent.trim() && accReasoning.trim()) finalContent = accReasoning;
+    if (finalContent.trim()) send({ type: 'replace', content: finalContent });
 
     send({ type: 'done', modelUsed: result.modelUsed });
     done();
