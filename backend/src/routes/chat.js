@@ -20,8 +20,23 @@ const LIMITS = {
   TEMPERATURE_MAX:       1,
 };
 
+const THINKING_OPEN  = '<thinking>';
+const THINKING_CLOSE = '</thinking>';
+
 const ACCEPTED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 const ACCEPTED_DOC_TYPES   = new Set(['application/pdf']);
+
+/**
+ * Retourne true si la fin de `str` pourrait être le début de `tag`.
+ * Permet de buffer les chunks partiels avant qu'un tag soit complet.
+ * Ex: str="bonjour <th", tag="<thinking>" → true
+ */
+function isPotentialTag(str, tag) {
+  for (let len = Math.min(tag.length - 1, str.length); len >= 1; len--) {
+    if (str.endsWith(tag.slice(0, len))) return true;
+  }
+  return false;
+}
 
 function validateInputs(message, attachments, max_tokens, temperature) {
   if (typeof message !== 'string' || message.trim().length === 0) return 'message requis';
@@ -131,9 +146,9 @@ function parseStepsFromPartial(partial) {
 }
 
 function stripThinking(content) {
-  if (content.includes('</thinking>'))
+  if (content.includes(THINKING_CLOSE))
     return content.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '').trimStart();
-  const idx = content.indexOf('<thinking>');
+  const idx = content.indexOf(THINKING_OPEN);
   if (idx !== -1) return content.slice(0, idx).trimEnd();
   return content;
 }
@@ -228,21 +243,10 @@ router.post('/', async (req, res) => {
     const messages = [{ role: 'system', content: systemPrompt }, ...buildHistory(), { role: 'user', content: userContent }];
 
     // ── 5. Appel LLM ──────────────────────────────────────────────────────────
-    //
-    // owl-alpha met TOUT dans delta.reasoning et RIEN dans delta.content.
-    // On accumule les deux séparément.
-    // Règle d'affichage :
-    //   - Pendant le stream : on streame reasoning en { type:'thinking' }
-    //                         et content en { type:'replace' }
-    //   - À la fin : si content est vide → on utilise reasoning comme contenu visible
-    //
     let accContent          = '';
     let accReasoning        = '';
     let lastSentThinkingLen = 0;
     let thinkingDone        = false;
-
-    // lastSentDisplayLen : curseur sur accContent pour ne pas renvoyer
-    // le même texte visible deux fois via replace
     let lastSentDisplayLen  = 0;
 
     const result = await openRouterFetch({
@@ -251,16 +255,15 @@ router.post('/', async (req, res) => {
       temperature: safeTemperature,
       messages,
 
-      // delta de content
       onChunk: (delta) => {
         accContent += delta;
 
-        const openIdx  = accContent.indexOf('<thinking>');
-        const closeIdx = accContent.indexOf('</thinking>');
+        const openIdx  = accContent.indexOf(THINKING_OPEN);
+        const closeIdx = accContent.indexOf(THINKING_CLOSE);
         const hasOpen  = openIdx  !== -1;
         const hasClose = closeIdx !== -1;
 
-        // ── Thinking en cours ─────────────────────────────────────────────
+        // ── Thinking en cours ───────────────────────────────────────────────
         if (hasOpen && !hasClose) {
           // Contenu AVANT <thinking> — envoyé une seule fois
           const before = accContent.slice(0, openIdx).trimEnd();
@@ -269,7 +272,7 @@ router.post('/', async (req, res) => {
             lastSentDisplayLen = before.length;
           }
           // Delta brut du thinking
-          const thinkingFull  = accContent.slice(openIdx + '<thinking>'.length);
+          const thinkingFull  = accContent.slice(openIdx + THINKING_OPEN.length);
           const thinkingDelta = thinkingFull.slice(lastSentThinkingLen);
           if (thinkingDelta.length > 0) {
             send({ type: 'thinking', content: thinkingDelta });
@@ -281,10 +284,10 @@ router.post('/', async (req, res) => {
           return;
         }
 
-        // ── Thinking fermé ────────────────────────────────────────────────
+        // ── Thinking fermé ──────────────────────────────────────────────────
         if (hasOpen && hasClose && !thinkingDone) {
           thinkingDone = true;
-          const thinkingFull  = accContent.slice(openIdx + '<thinking>'.length, closeIdx);
+          const thinkingFull  = accContent.slice(openIdx + THINKING_OPEN.length, closeIdx);
           const thinkingDelta = thinkingFull.slice(lastSentThinkingLen);
           if (thinkingDelta.length > 0) {
             send({ type: 'thinking', content: thinkingDelta });
@@ -295,28 +298,28 @@ router.post('/', async (req, res) => {
             send({ type: 'thinkingSteps', steps: steps.map(s => ({ label: s.title, icon: 'think', done: true })) });
         }
 
-        // Contenu visible nettoyé — toujours envoyé en replace (contenu COMPLET)
+        // ── FIX : buffer si la fin d'accContent est un tag partiel ─────────
+        // Cas 1 : pas encore de <thinking> mais la fin ressemble à son début
+        if (!hasOpen && isPotentialTag(accContent, THINKING_OPEN)) return;
+
+        // Cas 2 : thinking fermé mais la fin ressemble à un début de </thinking>
+        if (!hasClose && hasOpen && isPotentialTag(accContent, THINKING_CLOSE)) return;
+
+        // ── Contenu visible nettoyé ─────────────────────────────────────────
         const displayContent = stripThinking(accContent);
         if (displayContent) send({ type: 'replace', content: displayContent });
       },
 
-      // delta de reasoning (owl-alpha met tout ici)
       onReasoningChunk: (delta) => {
         accReasoning += delta;
-        // Streamer le reasoning comme thinking en temps réel
         send({ type: 'thinking', content: delta });
       },
     });
 
     // ── Flush final ────────────────────────────────────────────────────────────
-    //
-    // FIX PRINCIPAL : owl-alpha envoie tout via reasoning, content reste vide.
-    // Si c'est le cas, on utilise reasoning comme contenu visible final.
-    //
     let finalContent = stripThinking(accContent);
 
     if (!finalContent.trim() && accReasoning.trim()) {
-      // Le modèle a tout mis dans reasoning — on l'utilise comme réponse
       console.log('[chat] Fallback : contenu vide → utilisation du reasoning comme réponse');
       finalContent = accReasoning;
     }
@@ -324,7 +327,6 @@ router.post('/', async (req, res) => {
     if (finalContent.trim()) {
       send({ type: 'replace', content: finalContent });
     } else {
-      // Vraiment rien — erreur explicite pour debug
       console.error('[chat] Réponse finale vide — accContent:', JSON.stringify(accContent.slice(0, 200)), '| accReasoning:', JSON.stringify(accReasoning.slice(0, 200)));
     }
 
