@@ -12,9 +12,9 @@ const KEYS = [
   process.env.OPENROUTER_KEY_5,
 ].filter(Boolean);
 const OPENROUTER_MODELS = {
-  opus:   'qwen/qwen3-coder:free',
-  sonnet: 'qwen/qwen3-coder:free',
-  haiku:  'qwen/qwen3-coder:free',
+  opus:   'deepseek/deepseek-r1:free',      // raisonnement fort
+  sonnet: 'meta-llama/llama-3.3-70b-instruct:free', // général/fallback
+  haiku:  'meta-llama/llama-3.3-70b-instruct:free',
 };
 
 const VISION_FALLBACK = 'openrouter/free';
