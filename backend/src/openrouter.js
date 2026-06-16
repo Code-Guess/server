@@ -6,16 +6,16 @@ const BASE_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 const KEYS = [
   process.env.OPENROUTER_KEY_1,
-  process.env.OPENROUTER_KEY_2,
+  process.env.OPENROUTER_KEY_2,  
   process.env.OPENROUTER_KEY_3,
   process.env.OPENROUTER_KEY_4,
   process.env.OPENROUTER_KEY_5,
 ].filter(Boolean);
 
 const OPENROUTER_MODELS = {
-  opus:   'openrouter/owl-alpha',
-  sonnet: 'openrouter/owl-alpha',
-  haiku:  'openai/gpt-oss-120b:free',
+  opus:   'openrouter/qwen3-coder:free',
+  sonnet: 'openrouter/qwen3-coder:free',
+  haiku:  'openai/qwen3-coder:free',
 };
 
 const VISION_FALLBACK = 'openrouter/free';
