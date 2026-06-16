@@ -6,15 +6,16 @@ const BASE_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 const KEYS = [
   process.env.OPENROUTER_KEY_1,
-  process.env.OPENROUTER_KEY_2,  
+  process.env.OPENROUTER_KEY_2,
   process.env.OPENROUTER_KEY_3,
   process.env.OPENROUTER_KEY_4,
   process.env.OPENROUTER_KEY_5,
 ].filter(Boolean);
+
 const OPENROUTER_MODELS = {
-  opus:   'openrouter/owl-apha',
-  sonnet: 'openrouter/owl-apha',
-  haiku:  'openai/qwen3-coder',
+  opus:   'openrouter/owl-alpha',   // FIX 1 : typo 'owl-apha' → 'owl-alpha'
+  sonnet: 'openrouter/owl-alpha',   // FIX 1 : idem
+  haiku:  'openrouter/gpt-oss-120b',
 };
 
 const VISION_FALLBACK = 'openrouter/free';
@@ -29,10 +30,9 @@ const MAX_TOKENS = {
 let keyIndex = 0;
 
 function getNextKey() {
-  const keys = KEYS;
-  if (keys.length === 0) throw new Error('Aucune clé OpenRouter configurée.');
-  const key = keys[keyIndex % keys.length];
-  keyIndex = (keyIndex + 1) % keys.length;
+  if (KEYS.length === 0) throw new Error('Aucune clé OpenRouter configurée.');
+  const key = KEYS[keyIndex % KEYS.length];
+  keyIndex = (keyIndex + 1) % KEYS.length;
   return key;
 }
 
@@ -205,23 +205,22 @@ async function openRouterFetch(options) {
       let errBody = {};
       try { errBody = await res.json(); } catch {}
 
-      const errMsg  = errBody?.error?.message ?? `Erreur HTTP ${res.status}`;
-      const isProviderError = errBody?.error?.code === 'provider_error'
-        || errMsg.toLowerCase().includes('provider')
-        || errMsg.toLowerCase().includes('overloaded')
-        || errMsg.toLowerCase().includes('unavailable');
+      const errMsg = errBody?.error?.message ?? `Erreur HTTP ${res.status}`;
+      const isProviderError =
+        errBody?.error?.code === 'provider_error' ||
+        errMsg.toLowerCase().includes('provider') ||
+        errMsg.toLowerCase().includes('overloaded') ||
+        errMsg.toLowerCase().includes('unavailable');
 
       console.warn(
         `[OpenRouter] HTTP ${res.status} (clé ...${key.slice(-6)}) | provider_error=${isProviderError} | msg: ${errMsg}`
       );
 
-      // 429, 5xx, ou erreur provider → retry avec la clé suivante
       if (res.status === 429 || res.status >= 500 || isProviderError) {
         lastError = new Error(errMsg);
         continue;
       }
 
-      // Autres 4xx (400 malformed, 401 auth…) → fail immédiat
       throw new Error(errMsg);
     }
 
@@ -237,8 +236,14 @@ async function openRouterFetch(options) {
       throw new Error('[OpenRouter] res.body est null — stream impossible');
     }
 
-    let content   = '';
-    let reasoning = '';
+    // FIX 2 : émettre le prefill immédiatement dans onChunk
+    if (prefill) {
+      options.onChunk?.(prefill);
+    }
+
+    let content     = '';
+    let reasoning   = '';
+    let streamError = false; // FIX 3 : flag pour sortir proprement du while
 
     const reader  = res.body.getReader();
     const decoder = new TextDecoder();
@@ -259,20 +264,17 @@ async function openRouterFetch(options) {
         try {
           const parsed = JSON.parse(payload);
 
-          // FIX : certains streams renvoient une erreur provider DANS le stream
-          // (HTTP 200 mais body contient { error: ... })
-          // On la détecte ici pour retry proprement.
+          // FIX 3 : erreur provider dans le stream → flag + cancel + break for
           if (parsed?.error) {
             const streamErrMsg = parsed.error?.message ?? 'Provider error in stream';
             console.warn(`[OpenRouter] Erreur dans le stream (clé ...${key.slice(-6)}):`, streamErrMsg);
-            lastError = new Error(streamErrMsg);
-            // Fermer le reader et passer à la clé suivante
+            lastError   = new Error(streamErrMsg);
+            streamError = true;
             try { await reader.cancel(); } catch {}
-            break;
+            break; // sort du for
           }
 
-          const { choices } = parsed;
-          const delta = choices?.[0]?.delta;
+          const delta = parsed.choices?.[0]?.delta;
 
           if (delta?.content) {
             content += delta.content;
@@ -287,12 +289,12 @@ async function openRouterFetch(options) {
         }
       }
 
-      // Si on a détecté une erreur dans le stream, sortir du while
-      if (lastError && content === '' && reasoning === '') break;
+      // FIX 3 : sort du while proprement si erreur stream détectée
+      if (streamError) break;
     }
 
-    // Si erreur stream sans contenu → retry
-    if (lastError && content === '' && reasoning === '') continue;
+    // Si erreur stream sans contenu → retry avec la clé suivante
+    if (streamError && content === '' && reasoning === '') continue;
 
     // ── Recoller le prefill si besoin ──────────────────────────────────────
     const finalContent = prefill
@@ -302,7 +304,6 @@ async function openRouterFetch(options) {
     return { content: finalContent, reasoning, modelUsed: model };
   }
 
-  // Toutes les clés ont échoué
   throw lastError ?? new Error('[OpenRouter] Toutes les clés ont échoué.');
 }
 
