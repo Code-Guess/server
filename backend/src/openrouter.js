@@ -11,11 +11,10 @@ const KEYS = [
   process.env.OPENROUTER_KEY_4,
   process.env.OPENROUTER_KEY_5,
 ].filter(Boolean);
-
 const OPENROUTER_MODELS = {
-  opus:   'openrouter/qwen3-coder',
-  sonnet: 'openrouter/qwen3-coder',
-  haiku:  'openai/qwen3-coder',
+  opus:   'qwen/qwen3-coder:free',
+  sonnet: 'qwen/qwen3-coder:free',
+  haiku:  'qwen/qwen3-coder:free',
 };
 
 const VISION_FALLBACK = 'openrouter/free';
