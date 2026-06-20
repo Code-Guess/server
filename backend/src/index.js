@@ -5,10 +5,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
 
-const express    = require('express');
-const cors       = require('cors');
-const helmet     = require('helmet');
-const chatRouter = require('./routes/chat');
+const express       = require('express');
+const cors          = require('cors');
+const helmet        = require('helmet');
+const chatRouter     = require('./routes/chat');
+const { rateLimiter } = require('./middleware/rateLimiter');
 
 const app     = express();
 const PORT    = process.env.PORT || 3001;
@@ -76,9 +77,9 @@ app.use('/api', (req, res, next) => {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-// /api/chat : limite 20mb pour les images/PDFs base64
-// express.json() appliqué ICI uniquement → la limite 20mb est effective
-app.use('/api/chat', express.json({ limit: '20mb' }), chatRouter);
+// /api/chat : rate-limiter d'abord (protège les clés OpenRouter avant tout
+// parsing), puis express.json() avec limite 20mb pour les images/PDFs base64
+app.use('/api/chat', rateLimiter, express.json({ limit: '20mb' }), chatRouter);
 
 // Health check minimal — non protégé intentionnellement
 app.get('/health', (_req, res) => {
